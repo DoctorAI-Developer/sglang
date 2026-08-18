@@ -1081,6 +1081,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Configure global environment
         configure_logger(server_args)
+        # Resolve the record for this engine: everything below -- the
+        # environment setup, the validation, the port arithmetic -- reads
+        # resolved configuration.
+        server_args.resolve_once()
+
         _set_envs_and_config(server_args)
 
         # Defensive: ensure plugins loaded (may already be loaded by

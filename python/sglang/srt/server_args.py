@@ -3568,7 +3568,14 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
-        self.resolve_once()
+        """Construction leaves the record at what the caller asked for.
+
+        Resolution is a separate act, entered through ``resolve_once``: the
+        launcher runs it once per engine, and every publishing process asks the
+        gate on the way in. A record that is only constructed -- a fixture, a
+        config being inspected, one being handed to a subprocess that will
+        resolve it itself -- stays raw.
+        """
 
     def resolve_once(self) -> None:
         """Run the resolution pipeline, unless this record has been through it.
@@ -3585,6 +3592,12 @@ class ServerArgs:
         if getattr(self, "_declarations_materialized", False):
             return
         self._run_resolution_pipeline()
+        # The pipeline has a second exit: a dummy or absent model path returns
+        # before the materialization that normally sets the flag. The gate is
+        # about whether the handlers ran, not about how far they got, so a
+        # dummy record is resolved once too -- and the read-only guard that
+        # reads the same flag arms with it.
+        self._declarations_materialized = True
 
     def _declare(self, source: str, **fields: Any) -> None:
         """This record's handlers declaring their resolution writes.

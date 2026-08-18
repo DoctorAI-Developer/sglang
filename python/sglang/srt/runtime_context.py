@@ -1034,10 +1034,14 @@ class _ServerArgsOverride:
         self._prev_capture = ctx.flags.capture.enable_torch_compile
         from sglang.srt.arg_groups.overrides import (
             _apply_fields,
-            declare_resolution,
+            declare_late_resolution,
         )
 
         server_args = ServerArgs(model_path="dummy")
+        # A dummy config still resolves what it can, so the bags a test reads
+        # carry the same defaults a real publish would give it; the overrides
+        # then layer on top.
+        server_args.resolve_once()
         # Underscore names seed private property caches (the strict guard
         # exempts them); everything else must be a real config field.
         unknown = {name for name in self._fields if not name.startswith("_")} - set(
@@ -1049,22 +1053,19 @@ class _ServerArgsOverride:
             )
         # Declared, not just written: the projection reads the resolution
         # result, so a field set here has to be part of it to reach the bags.
+        # Late, because the record has been resolved already and is about to be
+        # published -- which is the same shape the launcher's validation has.
         # Underscore names are not fields at all (they seed private property
         # caches), so they stay a direct write.
         declared = {
             name: value for name, value in self._fields.items() if name[0] != "_"
         }
         if declared:
-            declare_resolution(server_args, "override_server_args", **declared)
+            declare_late_resolution(server_args, "override_server_args", **declared)
         _apply_fields(
             server_args,
             {name: value for name, value in self._fields.items() if name[0] == "_"},
         )
-        # The dummy boundary skips materialization, which would leave the
-        # strict mutation guard unarmed on the published object — mark it
-        # materialized so bare post-publish writes raise like they do on a
-        # fully resolved config.
-        object.__setattr__(server_args, "_declarations_materialized", True)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
