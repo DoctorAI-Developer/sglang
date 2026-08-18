@@ -42,6 +42,7 @@ from sglang.srt.arg_groups.argparse_actions import (
 )
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
+    declare_direct_writes,
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
     remote_instance_transfer_engine_of,
@@ -3603,6 +3604,14 @@ class ServerArgs:
            belong in the helper or signal that the helper should be split.
         """
 
+        # What the caller asked for, before any handler runs. Every resolution
+        # write is declared, so this plus the stash is the resolution result --
+        # which is what the config projection reads, rather than the fields it
+        # happens to find afterwards.
+        self._raw_input = {
+            field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+        }
+
         # Declaration stash for the override/post-process passes. Set before any
         # short-circuit (none/dummy model paths) so run_post_process_pass and
         # direct handler invocations can rely on it even when
@@ -3661,8 +3670,14 @@ class ServerArgs:
         self._handle_mps_backends()
         self._handle_xpu_backends()
 
-        # Allow OOT platform plugins to apply server args defaults.
-        current_platform.apply_server_args_defaults(self)
+        # Allow OOT platform plugins to apply server args defaults. They set
+        # the fields directly -- an interface this tree does not own -- so the
+        # diff is what records the defaults they applied.
+        declare_direct_writes(
+            self,
+            f"platform:{current_platform.device_name}",
+            current_platform.apply_server_args_defaults,
+        )
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
