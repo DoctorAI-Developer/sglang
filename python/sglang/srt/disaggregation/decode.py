@@ -551,7 +551,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
-            if _is_fake_transfer(req, self.scheduler.server_args):
+            if _is_fake_transfer(req):
                 decode_req.kv_receiver.init(0)
                 return
 
@@ -604,9 +604,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, req: Req, is_rebootstrap: bool = False
     ) -> DecodeRequest:
         backend = (
-            TransferBackend.FAKE
-            if _is_fake_transfer(req, self.scheduler.server_args)
-            else self.transfer_backend
+            TransferBackend.FAKE if _is_fake_transfer(req) else self.transfer_backend
         )
         kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
 
@@ -1270,7 +1268,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if (
                 self.scheduler.enable_hisparse
                 and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-                and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+                and not _is_fake_transfer(decode_req.req)
             ):
                 # alloc_logical_only() already allocated the shared logical pages
                 # used by C4 indexer and C128 KV. These device buffers do not use
@@ -1850,7 +1848,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             else 0
         )
 
-        if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
+        if _is_fake_transfer(decode_req.req):
             pass
         elif actual_room == 0:
             # Should never happen: _poll_with_metadata_gate already confirmed
@@ -1988,7 +1986,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
-            server_args=self.scheduler.server_args,
         )
 
     def _poll_with_staging(self) -> list:
@@ -1997,7 +1994,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.staging_handler,
             self.gloo_group,
             metadata_buffers=self.metadata_buffers,
-            server_args=self.scheduler.server_args,
         )
 
     def _init_staging_handler(self, kv_manager):
