@@ -1326,6 +1326,11 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; declare "
             "its namespace set (None for the full tree)."
         )
+    # Resolve before projecting: the bags are the resolution result, so the
+    # pipeline has to have run. A record that already carries its declarations
+    # -- one this process resolved, or one a parent resolved before pickling it
+    # here -- is left alone.
+    server_args.resolve_once()
     # Re-projecting drops every override taken since the last publish. That is
     # what an engine rebuild wants -- the new engine must not inherit the old
     # one's runtime scaling -- but it is never what a caller wants silently, so
