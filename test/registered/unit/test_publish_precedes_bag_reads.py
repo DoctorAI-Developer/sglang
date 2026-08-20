@@ -158,6 +158,51 @@ def _calls(fn):
     return out
 
 
+def _publish_names():
+    """Names that install the record into the context slot, derived.
+
+    Matching the spellings by hand is how this guard went stale: a defensive
+    publish arrived under a new name (`ensure_published`) and the walk stopped
+    recognising the tokenizer manager as publishing at all, which turned a
+    correct module into a reported violation. So a publisher is defined by what
+    it does -- any module-level function in `runtime_context` / `server_args`
+    that transitively reaches `set_server_args` on the context.
+    """
+    reaches, graph = set(), {}
+    for relative in ("runtime_context.py", "server_args.py"):
+        tree = ast.parse(
+            (_PACKAGE_ROOT / "srt" / relative).read_text(encoding="utf-8-sig")
+        )
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            called, installs = set(), False
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Call):
+                    continue
+                if (
+                    isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == "set_server_args"
+                ):
+                    installs = True
+                elif isinstance(inner.func, ast.Name):
+                    called.add(inner.func.id)
+            graph[node.name] = called
+            if installs:
+                reaches.add(node.name)
+    growing = True
+    while growing:
+        growing = False
+        for name, called in graph.items():
+            if name not in reaches and called & reaches:
+                reaches.add(name)
+                growing = True
+    return frozenset(reaches)
+
+
+_PUBLISH_NAMES = _publish_names()
+
+
 class _Module:
     """One parsed module: what it calls the config API, and what it defines.
 
@@ -183,9 +228,7 @@ class _Module:
                 if node.module in _CONFIG_MODULES:
                     for alias in node.names:
                         local = alias.asname or alias.name
-                        if alias.name == "publish" or alias.name.startswith(
-                            "set_global_server_args"
-                        ):
+                        if alias.name in _PUBLISH_NAMES:
                             self.publishers.add(local)
                         elif alias.name in _ACCESSORS:
                             self.accessors.add(local)

@@ -19,11 +19,15 @@ from sglang.srt.runtime_context import (
     ParallelContext,
     RuntimeContext,
     _FlagGroupBase,
+    ensure_published,
     get_context,
+    get_exec,
     get_flags,
     get_parallel,
     get_server_args,
     max_speculative_num_draft_tokens,
+    publish,
+    publish_role,
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
@@ -246,6 +250,142 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         reset_context()
         with self.assertRaises(ValueError):
             get_server_args()
+
+
+class TestEnsurePublished(_IsolatedServerArgs):
+    """A defensive publish must not re-project over a live process.
+
+    `ModelRunner` and `TokenizerManager` publish in their constructors because
+    either can be built standalone with nothing published first. Inside a real
+    process the launcher published the same record already, and publishing
+    again re-projects the bags -- discarding every `override()` taken since,
+    and the provenance log with it. The scheduler process has a window that
+    reaches a real override: the grammar backend's import fallback runs while
+    the scheduler builds, before the model worker that used to re-publish.
+    """
+
+    def _record(self, **fields):
+        return ServerArgs(model_path="dummy", **fields)
+
+    def test_a_second_publish_of_the_same_record_keeps_the_overrides(self):
+        record = self._record(grammar_backend="xgrammar")
+        publish(record, role="scheduler")
+        get_context().override("grammar.import_fallback", grammar_backend="none")
+
+        ensure_published(record, role="scheduler")
+
+        self.assertEqual(
+            get_exec().kernel.grammar_backend,
+            "none",
+            "the constructor's publish re-projected the bags, so the import "
+            "fallback was discarded and the process reports a backend it is "
+            "not using",
+        )
+        self.assertEqual(
+            len(get_context().overrides_log()),
+            1,
+            "the provenance of the override went with it",
+        )
+
+    def test_a_different_record_is_published(self):
+        first = self._record(grammar_backend="xgrammar")
+        publish(first, role="scheduler")
+        second = self._record(grammar_backend="llguidance")
+
+        ensure_published(second, role="scheduler")
+
+        self.assertIs(get_server_args(), second)
+        self.assertEqual(get_exec().kernel.grammar_backend, "llguidance")
+
+    def test_an_empty_slot_is_published(self):
+        """The standalone case the defensive publish exists for."""
+        reset_context()
+        record = self._record(grammar_backend="xgrammar")
+
+        ensure_published(record, role="scheduler")
+
+        self.assertIs(get_server_args(), record)
+        self.assertEqual(publish_role(), "scheduler")
+
+    def test_the_same_record_under_a_different_role_is_republished(self):
+        """The role decides which namespaces this process may read."""
+        record = self._record()
+        publish(record, role="tokenizer")
+
+        ensure_published(record, role="scheduler")
+
+        self.assertEqual(publish_role(), "scheduler")
+
+    def test_every_constructor_that_publishes_is_classified(self):
+        """A new constructor publish has to say which of the two it is.
+
+        Publishing in a constructor is right when the constructor *is* the
+        process entry (a spawned encoder worker, the Ray actor that stands in
+        for `run_scheduler_process`) and wrong when the process is already
+        live, where it silently drops overrides. The difference is not visible
+        in the syntax, so the census is pinned: adding one fails here until it
+        is classified.
+        """
+        import ast
+        import pathlib
+
+        import sglang
+
+        srt = pathlib.Path(sglang.__file__).resolve().parent / "srt"
+        found = set()
+        for path in sorted(srt.rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            except SyntaxError:
+                self.fail(f"unparsable module in the census: {path}")
+            publishers = set()
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module
+                    and (
+                        node.module.endswith("runtime_context")
+                        or node.module.endswith("server_args")
+                    )
+                ):
+                    continue
+                for alias in node.names:
+                    if alias.name in (
+                        "publish",
+                        "ensure_published",
+                        "set_global_server_args_for_scheduler",
+                        "set_global_server_args_for_tokenizer",
+                    ):
+                        publishers.add(alias.asname or alias.name)
+            if not publishers:
+                continue
+            for function in ast.walk(tree):
+                if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if function.name != "__init__":
+                    continue
+                for node in ast.walk(function):
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id in publishers
+                    ):
+                        found.add((path.relative_to(srt).as_posix(), node.func.id))
+        self.assertEqual(
+            found,
+            {
+                # Process entries: the constructor is the first thing that runs
+                # in a spawned worker, so a plain publish is what belongs here.
+                ("disaggregation/encode_server.py", "publish"),
+                ("ray/scheduler_actor.py", "publish"),
+                # Defensive: the process is usually already live.
+                ("managers/tokenizer_manager.py", "ensure_published"),
+                ("model_executor/model_runner.py", "ensure_published"),
+            },
+            "a constructor publishes and this census does not know which kind "
+            "it is; a process entry uses publish(), one that may run inside a "
+            "live process uses ensure_published()",
+        )
 
 
 class TestServerArgsScopedOverride(_IsolatedServerArgs):

@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
 import math
 import os
 import sys
@@ -56,6 +57,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 
 # Imported lazily so this module has no import-time dependencies: any module can
@@ -1304,6 +1307,22 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; declare "
             "its namespace set (None for the full tree)."
         )
+    # Re-projecting drops every override taken since the last publish. That is
+    # what an engine rebuild wants -- the new engine must not inherit the old
+    # one's runtime scaling -- but it is never what a caller wants silently, so
+    # say which ones went. A constructor that publishes defensively should use
+    # `ensure_published` instead of reaching this path at all.
+    discarded = _CONTEXT.overrides_log()
+    if discarded:
+        logger.warning(
+            "publish(role=%s) re-projected the config bags and dropped %d "
+            "override(s) taken since the last publish: %s",
+            role,
+            len(discarded),
+            ", ".join(
+                f"{source}({', '.join(sorted(fields))})" for source, fields in discarded
+            ),
+        )
     _CONTEXT.set_server_args(server_args)
     _CONTEXT._publish_role = role
     if _ROLE_NS_MODE == "record":
@@ -1318,6 +1337,27 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             flush=True,
         )
     return _CONTEXT
+
+
+def ensure_published(server_args, *, role: str) -> RuntimeContext:
+    """Publish unless this exact record is already published under this role.
+
+    Two constructors publish defensively because either can be built standalone
+    with nothing published before it -- `ModelRunner` (a benchmark harness, the
+    manual runner tests) and `TokenizerManager`. Inside a real process the
+    launcher published the same record already, and publishing again re-projects
+    the bags: every `override()` taken between the two calls is discarded, and
+    the provenance log with it. The scheduler process has a window that reaches
+    a real override (the grammar backend's import fallback runs while the
+    scheduler builds, before the model worker exists).
+
+    So these callers ask for the end state -- this record, this role, published
+    -- and get a no-op when that already holds. An engine rebuild still calls
+    `publish` directly, because there the reset is the point.
+    """
+    if _CONTEXT._server_args is server_args and _CONTEXT._publish_role == role:
+        return _CONTEXT
+    return publish(server_args, role=role)
 
 
 def publish_role() -> str | None:
