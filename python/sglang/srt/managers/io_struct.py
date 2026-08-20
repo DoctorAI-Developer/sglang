@@ -333,6 +333,13 @@ class GenerateReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
+    # Speculative training fields
+    spec_training_data_id: Optional[Union[List[str], str]] = None
+    packed_loss_mask: Optional[Union[List[str], str]] = None
+
+    def is_spec_training_request(self) -> bool:
+        return self.spec_training_data_id is not None
+
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
@@ -530,6 +537,7 @@ class GenerateReqInput:
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_spec_training_params(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -832,6 +840,24 @@ class GenerateReqInput:
         elif isinstance(self.decode_tp_size, list):
             self.decode_tp_size = self.decode_tp_size * self.parallel_sample_num
 
+    def _normalize_spec_training_params(self, num):
+        """Normalize speculative training parameters for batch processing."""
+        if self.spec_training_data_id is None:
+            self.spec_training_data_id = [None] * num
+        elif not isinstance(self.spec_training_data_id, list):
+            self.spec_training_data_id = [self.spec_training_data_id] * num
+        elif isinstance(self.spec_training_data_id, list):
+            self.spec_training_data_id = (
+                self.spec_training_data_id * self.parallel_sample_num
+            )
+
+        if self.packed_loss_mask is None:
+            self.packed_loss_mask = [None] * num
+        elif not isinstance(self.packed_loss_mask, list):
+            self.packed_loss_mask = [self.packed_loss_mask] * num
+        elif isinstance(self.packed_loss_mask, list):
+            self.packed_loss_mask = self.packed_loss_mask * self.parallel_sample_num
+
     def _get_positional_embed_overrides_item(
         self, i: int
     ) -> Optional[PositionalEmbeds]:
@@ -928,6 +954,14 @@ class GenerateReqInput:
             return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
             received_time=self.received_time,
+            spec_training_data_id=(
+                self.spec_training_data_id[i]
+                if self.spec_training_data_id is not None
+                else None
+            ),
+            packed_loss_mask=(
+                self.packed_loss_mask[i] if self.packed_loss_mask is not None else None
+            ),
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None
@@ -968,6 +1002,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to return hidden states
     return_hidden_states: ReturnHiddenStatesMode = False
+
+    # Speculative training fields
+    spec_training_data_id: Optional[str] = None
+    packed_loss_mask: Optional[str] = None
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
@@ -1472,6 +1510,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
+    # Speculative training fields
+    spec_training_data_ids: Optional[List[str]] = None
+    packed_loss_masks: Optional[List[str]] = None
+    spec_training_mooncake_store_keys: Optional[List[List[str]]] = None
+
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
@@ -1562,6 +1605,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
+
+    # Speculative training fields
+    spec_training_data_ids: Optional[List[str]] = None
+    packed_loss_masks: Optional[List[str]] = None
+    spec_training_mooncake_store_keys: Optional[List[List[str]]] = None
 
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]

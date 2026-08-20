@@ -145,6 +145,10 @@ class LogitsProcessorOutput:
     # They should be moved to GenerationBatchResult to keep this class clean.
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    ## Part 6: Spec training - skip sampling and use these fake token ids
+    skip_sampling_next_token_ids: Optional[torch.Tensor] = None
+    last_hidden_states: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -184,6 +188,9 @@ class LogitsMetadata:
     is_prefill_only: bool = False
 
     mm_input_embeds: Optional[torch.Tensor] = None
+
+    # For spec training
+    has_spec_training: bool = False
 
     # DRAFT_EXTEND_V2: when set, lm_head runs only on these rows (see
     # EagleDraftExtendInput.select_index).
@@ -244,6 +251,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
+            has_spec_training=forward_batch.has_spec_training,
             draft_extend_select_index=draft_extend_select_index,
         )
 
@@ -391,7 +399,48 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+
+        # Spec training: keep the last hidden states for the trainer (the
+        # variable is deleted below, so capture it first).
+        last_hidden_states = hidden_states if logits_metadata.has_spec_training else None
         del hidden_states
+
+        # For offline spec training (prefill-only, no decode), skip sampling
+        # and return fake EOS. The hidden states are transferred via the
+        # EagleMooncakeStore for the trainer.
+        if (
+            logits_metadata.has_spec_training
+            and logits_metadata.forward_mode.is_extend()
+        ):
+            if logits_metadata.extend_seq_lens is not None:
+                num_seqs = len(logits_metadata.extend_seq_lens)
+            elif input_ids is not None:
+                num_seqs = input_ids.shape[0]
+            else:
+                num_seqs = 1
+            eos_token_id = getattr(self.config, "eos_token_id", 0)
+            if isinstance(eos_token_id, list):
+                eos_token_id = eos_token_id[0]
+            if input_ids is not None:
+                device = input_ids.device
+            elif isinstance(hidden_states_to_store, torch.Tensor):
+                device = hidden_states_to_store.device
+            elif isinstance(hidden_states_to_store, tuple):
+                device = hidden_states_to_store[0].device
+            else:
+                device = lm_head.weight.device
+            fake_next_token_ids = torch.full(
+                (num_seqs,),
+                eos_token_id,
+                dtype=torch.long,
+                device=device,
+            )
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states,
+                skip_sampling_next_token_ids=fake_next_token_ids,
+            )
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
@@ -441,6 +490,7 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
+            or logits_metadata.has_spec_training
         ):
             if logits_metadata.draft_extend_select_index is not None:
                 # Only next_token_logits narrows to [bs, vocab]; the

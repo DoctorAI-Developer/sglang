@@ -47,6 +47,13 @@ def resolve_spec_aux_hidden_state_config(
     is_draft_worker: bool,
 ) -> SpecAuxHiddenStateConfig:
     config = SpecAuxHiddenStateConfig()
+    # Spec training: force aux hidden-state capture from the server args.
+    if server_args.enable_aux_hidden_states:
+        config.eagle_use_aux_hidden_state = True
+        if server_args.aux_hidden_state_layer_ids is not None:
+            config.eagle_aux_hidden_state_layer_ids = list(
+                server_args.aux_hidden_state_layer_ids
+            )
     _resolve_eagle_aux_hidden_state(
         config=config,
         server_args=server_args,

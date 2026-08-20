@@ -1771,6 +1771,10 @@ class ModelRunner:
         """
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
+        # Spec training: skip sampling and return fake EOS tokens.
+        if logits_output.skip_sampling_next_token_ids is not None:
+            return logits_output.skip_sampling_next_token_ids
+
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,

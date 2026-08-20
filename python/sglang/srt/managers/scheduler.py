@@ -514,6 +514,26 @@ class Scheduler(
         # so patching them afterwards is a no-op.
         maybe_revert_pr_fix()
 
+        # Start mooncake store init in background (overlaps with model loading)
+        self._mooncake_init_thread = None
+        self._mooncake_init_error = None
+        self.eagle_mooncake_store = None
+        if self.server_args.enable_spec_training_mooncake and self.ps.attn_tp_rank == 0:
+            import threading
+
+            mooncake_device = torch.device(f"cuda:{self.ps.gpu_id}")
+
+            def _init_mooncake():
+                try:
+                    self.init_eagle_mooncake_store(device=mooncake_device)
+                except Exception as e:
+                    self._mooncake_init_error = e
+
+            self._mooncake_init_thread = threading.Thread(
+                target=_init_mooncake, daemon=True
+            )
+            self._mooncake_init_thread.start()
+
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
 
@@ -655,8 +675,33 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
+        # Wait for background mooncake store init to complete
+        if self._mooncake_init_thread is not None:
+            self._mooncake_init_thread.join()
+            if self._mooncake_init_error is not None:
+                raise self._mooncake_init_error
+
         self.is_initializing = False
         self.init_startup_timing_summary()
+
+    def init_eagle_mooncake_store(self, device=None):
+        if self.server_args.enable_spec_training_mooncake:
+            try:
+                from torchspec.transfer.mooncake import (
+                    EagleMooncakeStore,
+                    MooncakeConfig,
+                )
+
+                config = MooncakeConfig.from_env()
+                store = EagleMooncakeStore(config)
+                store.setup(device=device or self.device)
+                store.warmup_rdma()
+                self.eagle_mooncake_store = store
+                logger.info("EagleMooncakeStore initialized for spec training")
+            except ImportError:
+                logger.warning(
+                    "torchspec.mooncake not found. Spec training mooncake store disabled."
+                )
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()
@@ -2150,6 +2195,7 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
+            get_eagle_mooncake_store=lambda: self.eagle_mooncake_store,
             rust_server=self.rust_server,
         )
 
@@ -2175,6 +2221,8 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            attn_tp_rank=self.ps.attn_tp_rank,
+            get_eagle_mooncake_store=lambda: self.eagle_mooncake_store,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -2436,6 +2484,8 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                spec_training_data_id=recv_req.spec_training_data_id,
+                packed_loss_mask=recv_req.packed_loss_mask,
             )
             req.tokenizer = self.tokenizer
 
@@ -2866,6 +2916,8 @@ class Scheduler(
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+            spec_training_data_id=recv_req.spec_training_data_id,
+            packed_loss_mask=recv_req.packed_loss_mask,
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
@@ -3730,7 +3782,10 @@ class Scheduler(
                                 # overlaps.
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
+                                    return_hidden_states=(
+                                        batch.return_hidden_states
+                                        and batch.spec_training_info is None
+                                    ),
                                 )
                             else:
                                 # Result D2H on copy_stream overlaps the next forward
@@ -3740,7 +3795,10 @@ class Scheduler(
                                 with self.copy_stream_ctx:
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
-                                        return_hidden_states=batch.return_hidden_states,
+                                        return_hidden_states=(
+                                            batch.return_hidden_states
+                                            and batch.spec_training_info is None
+                                        ),
                                     )
                         else:
                             batch_result.future_indices = future_indices
@@ -3779,7 +3837,10 @@ class Scheduler(
                 batch_result.copy_done = self.device_module.Event()
                 batch_result.copy_to_cpu(
                     return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
+                    return_hidden_states=(
+                        batch.return_hidden_states
+                        and batch.spec_training_info is None
+                    ),
                 )
             else:
                 kwargs = (

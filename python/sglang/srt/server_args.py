@@ -2259,6 +2259,29 @@ class ServerArgs:
         NS("spec"),
     ] = None
 
+    # -------------------------------------------------------------------------
+    # Spec training (for speculative decoding model training)
+    # -------------------------------------------------------------------------
+    enable_spec_training_mooncake: A[
+        bool,
+        "Enable EagleMooncakeStore for spec training hidden state transfer.",
+    ] = False
+    enable_aux_hidden_states: A[
+        bool,
+        "Enable capturing auxiliary hidden states for supported models.",
+    ] = False
+    aux_hidden_state_layer_ids: A[
+        Optional[List[int]],
+        "Layer IDs to capture as auxiliary hidden states. If omitted, model defaults are used.",
+    ] = None
+    spec_training_store_last_hidden_states: A[
+        bool,
+        Arg(
+            help="Whether to store last hidden states for spec training requests.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
+
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.
     decoupled_spec_bind_endpoint: A[

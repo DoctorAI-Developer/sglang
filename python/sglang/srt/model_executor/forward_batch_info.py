@@ -700,6 +700,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ).to(device, non_blocking=True)
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
 
+    # For spec training
+    has_spec_training: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -715,18 +718,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
         if capture_hidden_mode is None:
-            request_capture_hidden_mode = (
-                CaptureHiddenMode.NULL
-                if model_runner.is_draft_worker
-                else max(
-                    batch.return_hidden_states_mode,
-                    get_server_return_hidden_states_mode(),
+            if batch.spec_training_info is not None:
+                capture_hidden_mode = CaptureHiddenMode.FULL
+            else:
+                request_capture_hidden_mode = (
+                    CaptureHiddenMode.NULL
+                    if model_runner.is_draft_worker
+                    else max(
+                        batch.return_hidden_states_mode,
+                        get_server_return_hidden_states_mode(),
+                    )
                 )
-            )
-            capture_hidden_mode = get_required_capture_hidden_mode(
-                request_capture_hidden_mode,
-                batch.spec_info,
-            )
+                capture_hidden_mode = get_required_capture_hidden_mode(
+                    request_capture_hidden_mode,
+                    batch.spec_info,
+                )
 
         # extend-mode-only fields are None on decode/idle
         if batch.forward_mode.is_decode_or_idle():
@@ -799,6 +805,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            # For spec training
+            has_spec_training=batch.spec_training_info is not None,
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,

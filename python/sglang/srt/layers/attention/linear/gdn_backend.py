@@ -186,6 +186,21 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
+        if (
+            verify_backend is not None
+            and verify_backend.is_flashinfer()
+            and not (
+                decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
+            )
+        ):
+            if not is_cuda():
+                raise ValueError("FlashInfer GDN verify backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                FlashInferGDNKernel,
+            )
+
+            flashinfer_kernel = FlashInferGDNKernel()
+
         # Verify kernel. An explicitly configured verify backend wins; the
         # historical auto rule (FlashInfer when the selected FlashInfer kernel
         # supports MTP verify) only applies when no explicit choice was made.
@@ -195,7 +210,9 @@ class GDNKernelDispatcher:
             self.verify_kernel = triton_kernel
             self.verify_kernel_is_flashinfer = False
         elif (
-            decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
+            (verify_backend is not None and verify_backend.is_flashinfer())
+            or decode_backend.is_flashinfer()
+            or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:
             self.verify_kernel = flashinfer_kernel
             self.verify_kernel_is_flashinfer = True

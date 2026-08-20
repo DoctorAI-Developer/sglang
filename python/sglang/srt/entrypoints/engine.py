@@ -406,6 +406,8 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        spec_training_data_id: Optional[Union[List[str], str]] = None,
+        packed_loss_mask: Optional[Union[List[str], str]] = None,
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
@@ -449,6 +451,8 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            spec_training_data_id=spec_training_data_id,
+            packed_loss_mask=packed_loss_mask,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -519,6 +523,8 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        spec_training_data_id: Optional[Union[List[str], str]] = None,
+        packed_loss_mask: Optional[Union[List[str], str]] = None,
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
@@ -562,6 +568,8 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             session_params=session_params,
             priority=priority,
+            spec_training_data_id=spec_training_data_id,
+            packed_loss_mask=packed_loss_mask,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

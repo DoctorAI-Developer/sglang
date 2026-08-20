@@ -31,7 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_schedule
+from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -62,6 +62,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    load_token_map,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
@@ -491,6 +492,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.selector is not None:
             # compute_candidates needs the target lm_head attached before capture.
             self.draft_model.lm_head = lm_head
+            token_map_path = get_spec().speculative_token_map
+            if token_map_path is not None:
+                tp_size = int(get_tp_group().world_size)
+                if tp_size != 1:
+                    raise ValueError(
+                        "DFlash2 selector token maps currently require tensor "
+                        f"parallel size 1, got tp_size={tp_size}."
+                    )
+                hot_token_id = load_token_map(token_map_path)
+                self.draft_model.set_selector_token_map(hot_token_id, lm_head)
+                reduced_weight = self.draft_model._selector_lm_head_weight
+                if self.ps.tp_rank == 0:
+                    logger.info(
+                        "DFLASH selector proposal vocabulary enabled. "
+                        "tokens=%d, copied_head_mib=%.2f, source=%s",
+                        int(hot_token_id.numel()),
+                        float(reduced_weight.numel() * reduced_weight.element_size())
+                        / (1024**2),
+                        token_map_path,
+                    )
             if self.ps.tp_rank == 0:
                 logger.info(
                     "DFLASH selector decode (greedy + sampling) folded into the "

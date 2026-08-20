@@ -413,6 +413,12 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
+    # transformers' Qwen3Config drops top-level sliding_window on load; fall
+    # back to the dflash_config copy that survives.
+    if sliding_window is None:
+        dflash_cfg = _get_dflash_config(config)
+        if dflash_cfg is not None:
+            sliding_window = dflash_cfg.get("sliding_window")
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
@@ -1037,6 +1043,11 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     return None
 
 
+def _pow2(x: int) -> int:
+    """Smallest power of 2 >= x (host-side; keeps CUDA-graph capture clean)."""
+    return 1 << (x - 1).bit_length()
+
+
 @triton.jit
 def _table_qk_norm_rope_kernel(
     qkv_ptr,
@@ -1048,6 +1059,8 @@ def _table_qk_norm_rope_kernel(
     q_size,
     NHQ: tl.constexpr,
     D: tl.constexpr,
+    HALF_PAD_CE: tl.constexpr,
+    D_PAD_CE: tl.constexpr,
     EPS: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
@@ -1055,10 +1068,14 @@ def _table_qk_norm_rope_kernel(
     pos = tl.load(pos_ptr + t).to(tl.int64)
 
     HALF: tl.constexpr = D // 2
-    half_ar = tl.arange(0, HALF)
-    d_ar = tl.arange(0, D)
-    cos = tl.load(cos_sin_ptr + pos * D + half_ar).to(tl.float32)
-    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar).to(tl.float32)
+    HALF_PAD: tl.constexpr = HALF_PAD_CE
+    D_PAD: tl.constexpr = D_PAD_CE
+    half_ar = tl.arange(0, HALF_PAD)
+    half_mask = half_ar < HALF
+    d_ar = tl.arange(0, D_PAD)
+    d_mask = d_ar < D
+    cos = tl.load(cos_sin_ptr + pos * D + half_ar, mask=half_mask, other=0.0).to(tl.float32)
+    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar, mask=half_mask, other=0.0).to(tl.float32)
 
     is_q = h < NHQ
     col0 = tl.where(is_q, h * D, q_size + (h - NHQ) * D).to(tl.int64)
@@ -1067,19 +1084,19 @@ def _table_qk_norm_rope_kernel(
     )
 
     row = qkv_ptr + t * row_stride + col0
-    x = tl.load(row + d_ar).to(tl.float32)
+    x = tl.load(row + d_ar, mask=d_mask, other=0.0).to(tl.float32)
     ms = tl.sum(x * x, 0) / D
     inv = 1.0 / tl.sqrt(ms + EPS)
-    w1 = tl.load(w_ptr + half_ar).to(tl.float32)
-    w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
-    x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
-    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
+    w1 = tl.load(w_ptr + half_ar, mask=half_mask, other=0.0).to(tl.float32)
+    w2 = tl.load(w_ptr + HALF + half_ar, mask=half_mask, other=0.0).to(tl.float32)
+    x1 = tl.load(row + half_ar, mask=half_mask, other=0.0).to(tl.float32) * inv * w1
+    x2 = tl.load(row + HALF + half_ar, mask=half_mask, other=0.0).to(tl.float32) * inv * w2
     x1 = x1.to(tl.bfloat16).to(tl.float32)
     x2 = x2.to(tl.bfloat16).to(tl.float32)
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
-    tl.store(row + half_ar, o1.to(tl.bfloat16))
-    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
+    tl.store(row + half_ar, o1.to(tl.bfloat16), mask=half_mask)
+    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16), mask=half_mask)
 
 
 def table_qk_norm_rope_(
@@ -1113,5 +1130,7 @@ def table_qk_norm_rope_(
         num_q_heads * head_dim,
         NHQ=num_q_heads,
         D=head_dim,
+        HALF_PAD_CE=_pow2(head_dim // 2),
+        D_PAD_CE=_pow2(head_dim),
         EPS=eps,
     )

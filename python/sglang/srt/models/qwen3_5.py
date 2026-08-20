@@ -141,7 +141,9 @@ _is_amx_available = cpu_has_amx_support()
 # covered by the fused kernel, which removes the two `.contiguous()` copies
 # plus the `torch.cat` of the unfused fallback. Other backends keep the
 # original tuple so their control flow is unchanged.
-_GDN_FUSED_QKVZBA_RATIOS = (1, 2, 4, 8) if _use_aiter else (1, 2, 4)
+_GDN_FUSED_QKVZBA_RATIOS = (
+    (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+)
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -1400,6 +1402,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
+    def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]):
+        # Alias of the DFlash path: same per-layer capture convention on this
+        # hybrid model (also used by spec-training aux hidden-state capture).
+        self.set_dflash_layers_to_capture(layers_to_capture)
+
     @property
     def start_layer(self) -> int:
         return self._start_layer
@@ -1444,7 +1451,14 @@ class Qwen3_5ForCausalLM(nn.Module):
                     forward_batch=forward_batch,
                     captured_last_layer_outputs=(
                         aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
+                        # Honor both capture conventions: the per-layer flag set by
+                        # set_dflash_layers_to_capture, and the layers_to_capture list
+                        # set directly by set_eagle3_layers_to_capture (which never
+                        # marks the per-layer flag on this hybrid model).
+                        if (
+                            getattr(layer, "_is_layer_to_capture", False)
+                            or layer_idx in self.layers_to_capture
+                        )
                         else None
                     ),
                 )

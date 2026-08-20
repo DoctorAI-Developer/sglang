@@ -93,6 +93,10 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    # Spec training: attn TP rank + lazy getter for the (background-initialized)
+    # EagleMooncakeStore living on the Scheduler.
+    attn_tp_rank: int
+    get_eagle_mooncake_store: Callable[[], Any]
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -509,10 +513,22 @@ class SchedulerBatchResultProcessor:
         if capture_hidden_mode.is_full():
             start = hidden_state_offset
             hidden_state_offset += extend_input_len
-            if not store or not req.return_hidden_states:
+            if not store:
                 return hidden_state_offset
 
             req_hidden_states = logits_output.hidden_states[start:hidden_state_offset]
+            # Spec training: route hidden states to the EagleMooncakeStore via
+            # RDMA instead of the host payload.
+            if req.spec_training_data_id is not None and self.attn_tp_rank == 0:
+                store_obj = self.get_eagle_mooncake_store()
+                if store_obj is not None:
+                    self._send_hidden_states_to_mooncake(
+                        req=req,
+                        hidden_states=req_hidden_states,
+                        logits_output=logits_output,
+                        hidden_state_offset=start,
+                    )
+                    return hidden_state_offset
             if req.return_hidden_states is True:
                 req.hidden_states.append(req_hidden_states.cpu().clone().tolist())
             elif req.return_hidden_states == "last":
@@ -529,6 +545,75 @@ class SchedulerBatchResultProcessor:
                 f"Unexpected hidden states capture mode: {capture_hidden_mode}"
             )
         return hidden_state_offset
+
+    def _put_spec_training_mooncake(
+        self,
+        *,
+        key: str,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        last_hidden_states: Optional[torch.Tensor],
+    ):
+        import os
+
+        store = self.get_eagle_mooncake_store()
+        if os.getenv("TORCHSPEC_USP_SHARDED_MOONCAKE") == "1":
+            max_seq_raw = os.environ.get("TORCHSPEC_USP_MAX_SEQ_LENGTH")
+            store.put_usp_shards(
+                key=key,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                last_hidden_states=last_hidden_states,
+                target=None,
+                sp_size=int(os.environ["TORCHSPEC_USP_SP_SIZE"]),
+                sp_ring_size=int(os.environ.get("TORCHSPEC_USP_RING_SIZE", "1")),
+                ttt_length=int(os.environ.get("TORCHSPEC_USP_TTT_LENGTH", "1")),
+                max_seq_length=int(max_seq_raw) if max_seq_raw else None,
+            )
+            return
+
+        store.put(
+            key=key,
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            last_hidden_states=last_hidden_states,
+        )
+
+    def _send_hidden_states_to_mooncake(
+        self,
+        *,
+        req: Req,
+        hidden_states: torch.Tensor,
+        logits_output: LogitsProcessorOutput,
+        hidden_state_offset: int,
+    ):
+        import uuid
+
+        data_id = req.spec_training_data_id
+        key = f"{data_id}_{uuid.uuid4().hex[:8]}"
+
+        seq_len = hidden_states.shape[0]
+        input_ids = torch.tensor(
+            req.origin_input_ids, dtype=torch.long, device=hidden_states.device
+        )
+
+        last_hidden_states = None
+        store_lhs = getattr(
+            self.server_args, "spec_training_store_last_hidden_states", True
+        )
+        if store_lhs and logits_output.last_hidden_states is not None:
+            last_hidden_states = logits_output.last_hidden_states[
+                hidden_state_offset : hidden_state_offset + seq_len
+            ]
+
+        self._put_spec_training_mooncake(
+            key=key,
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            last_hidden_states=last_hidden_states,
+        )
+
+        req.spec_training_mooncake_store_keys.append(key)
 
     @staticmethod
     def _append_decode_hidden_states(

@@ -233,6 +233,28 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         tree_verify.assert_called_once()
         flashinfer_kernel.target_verify.assert_not_called()
 
+    def test_explicit_flashinfer_verify_constructs_independent_kernel(self):
+        flashinfer_kernel = MagicMock(supports_target_verify=True)
+        with (
+            patch.object(gdn_backend, "is_cuda", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+                "FlashInferGDNKernel",
+                return_value=flashinfer_kernel,
+            ) as kernel_cls,
+        ):
+            dispatcher = GDNKernelDispatcher(
+                LinearAttnKernelBackend.TRITON,
+                LinearAttnKernelBackend.TRITON,
+                LinearAttnKernelBackend.FLASHINFER,
+            )
+
+        kernel_cls.assert_called_once_with()
+        self.assertIs(dispatcher.verify_kernel, flashinfer_kernel)
+        self.assertTrue(dispatcher.verify_kernel_is_flashinfer)
+        self.assertIsInstance(dispatcher.decode_kernel, TritonGDNKernel)
+        self.assertIsInstance(dispatcher.extend_kernel, TritonGDNKernel)
+
     def test_helion_backend_reports_kda_only(self):
         cases = (
             (LinearAttnKernelBackend.HELION, LinearAttnKernelBackend.TRITON),

@@ -943,6 +943,51 @@ class DFlash2DraftModel(DFlashDraftModel):
         # The draft has no head of its own; the worker points this at the target's
         # before capture.
         self.lm_head: Optional[nn.Module] = None
+        # Optional FR-Spec-style proposal vocabulary. These tensors are created
+        # after both target and draft weights are loaded, before CUDA-Graph
+        # capture. They are intentionally not checkpoint state: the token map is
+        # a serving policy supplied by the operator, while the reduced matrix is
+        # an exact row selection from the target head.
+        self._selector_hot_token_id: Optional[torch.Tensor] = None
+        self._selector_lm_head_weight: Optional[torch.Tensor] = None
+
+    def set_selector_token_map(
+        self, token_ids: torch.Tensor, lm_head: nn.Module
+    ) -> None:
+        """Restrict DFlash2 proposal scoring to a validated target-vocab subset.
+
+        Target verification remains full-vocabulary and therefore lossless. The
+        copied, contiguous rows remove the per-replay advanced-indexing cost and
+        keep CUDA-Graph addresses stable.
+        """
+        weight = getattr(lm_head, "weight", None)
+        if not is_dense_head_weight(weight):
+            raise RuntimeError(
+                "DFlash2 selector token maps require a dense FP16/BF16/FP32 "
+                "target lm_head."
+            )
+        token_ids = torch.as_tensor(token_ids, dtype=torch.int64).flatten()
+        top_k = int(self.candidate_selector.top_k)
+        if int(token_ids.numel()) < top_k:
+            raise ValueError(
+                "DFlash2 selector token map is smaller than selector_top_k: "
+                f"map_size={int(token_ids.numel())}, selector_top_k={top_k}."
+            )
+        if int(torch.unique(token_ids).numel()) != int(token_ids.numel()):
+            raise ValueError("DFlash2 selector token map must contain unique ids.")
+        org_vocab_size = int(getattr(lm_head, "org_vocab_size", weight.shape[0]))
+        if bool(((token_ids < 0) | (token_ids >= org_vocab_size)).any().item()):
+            raise ValueError(
+                "DFlash2 selector token map contains an id outside the target "
+                f"vocabulary [0, {org_vocab_size})."
+            )
+
+        # Ascending original ids retain the dense head's deterministic tie order.
+        token_ids = torch.sort(token_ids).values.to(weight.device)
+        self._selector_hot_token_id = token_ids.contiguous()
+        self._selector_lm_head_weight = torch.index_select(
+            weight, 0, self._selector_hot_token_id
+        ).contiguous()
 
     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
@@ -969,11 +1014,23 @@ class DFlash2DraftModel(DFlashDraftModel):
             raise RuntimeError(
                 "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head."
             )
-        hidden = hidden.to(weight.dtype)
+        selector_weight = self._selector_lm_head_weight
+        hot_token_id = self._selector_hot_token_id
+        if selector_weight is None:
+            selector_weight = weight
+        hidden = hidden.to(selector_weight.dtype)
         if get_parallel().tp_size == 1:
-            org = int(self.lm_head.org_vocab_size)
-            vals, ids = _radix_topk(torch.matmul(hidden, weight[:org].T), k)
+            if hot_token_id is None:
+                org = int(self.lm_head.org_vocab_size)
+                selector_weight = selector_weight[:org]
+            vals, ids = _radix_topk(torch.matmul(hidden, selector_weight.T), k)
+            if hot_token_id is not None:
+                ids = hot_token_id[ids]
             return ids.long(), self._transform_unary_logits(vals)
+        if hot_token_id is not None:
+            raise RuntimeError(
+                "DFlash2 selector token maps currently require tensor parallel size 1."
+            )
         shard = self.lm_head.shard_indices
         vals, ids = _radix_topk(
             torch.matmul(hidden, weight[: int(shard.num_org_elements)].T), k

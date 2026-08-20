@@ -485,6 +485,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             token_steps=recv_obj.token_steps,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
+            spec_training_data_ids=recv_obj.spec_training_data_ids,
+            packed_loss_masks=recv_obj.packed_loss_masks,
+            spec_training_mooncake_store_keys=recv_obj.spec_training_mooncake_store_keys,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):

@@ -896,7 +896,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
-
         async def stream_results() -> AsyncIterator[bytes]:
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
@@ -937,6 +936,23 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+
+@app.api_route("/generate_for_spec_training", methods=["POST", "PUT"])
+async def generate_for_spec_training(obj: GenerateReqInput, request: Request):
+    """Handle a speculative training data collection request.
+
+    This endpoint reuses the generate flow but expects spec_training_data_id
+    and packed_loss_mask to be set.
+    """
+    try:
+        ret = await _global_state.tokenizer_manager.generate_request(
+            obj, request
+        ).__anext__()
+        return ret
+    except ValueError as e:
+        logger.error(f"[http_server] Error: {e}")
+        return _create_error_response(e)
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])

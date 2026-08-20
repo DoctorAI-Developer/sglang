@@ -4,11 +4,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sglang.srt.models.dflash as dflash_module
 from sglang.srt.models.dflash import (
     CandidateSelector,
     DFlash2DraftModel,
     _grouped_conv,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -81,6 +83,64 @@ def test_selector_rejects_a_quantized_target_lm_head():
     )
     with pytest.raises(RuntimeError, match="requires a dense"):
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
+
+
+def test_selector_token_map_scores_only_selected_rows_and_restores_global_ids(
+    monkeypatch,
+):
+    monkeypatch.setattr(dflash_module, "_flashinfer_top_k", None)
+    weight = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [-1.0, 1.0],
+            [2.0, -1.0],
+            [0.5, 2.0],
+        ]
+    )
+    lm_head = SimpleNamespace(weight=weight, org_vocab_size=6)
+    model = SimpleNamespace(
+        lm_head=lm_head,
+        candidate_selector=SimpleNamespace(top_k=2),
+        draft_config=parse_dflash_draft_config(
+            draft_hf_config={
+                "num_hidden_layers": 5,
+                "dflash_config": {"selector_rank": 2, "selector_top_k": 2},
+            }
+        ),
+        _selector_hot_token_id=None,
+        _selector_lm_head_weight=None,
+    )
+    model._transform_unary_logits = lambda logits: (
+        DFlash2DraftModel._transform_unary_logits(model, logits)
+    )
+    DFlash2DraftModel.set_selector_token_map(model, torch.tensor([5, 1, 3]), lm_head)
+
+    hidden = torch.tensor([[0.0, 1.0], [1.0, -1.0]])
+    with get_parallel().override(tp_size=1):
+        ids, vals = DFlash2DraftModel.compute_candidates(model, hidden)
+    expected_vals, expected_local_ids = torch.topk(
+        hidden @ weight[torch.tensor([1, 3, 5])].T, 2, dim=-1
+    )
+    expected_ids = torch.tensor([1, 3, 5])[expected_local_ids]
+    torch.testing.assert_close(ids, expected_ids)
+    torch.testing.assert_close(vals, expected_vals)
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "match"),
+    [
+        (torch.tensor([1]), "smaller than selector_top_k"),
+        (torch.tensor([1, 1]), "unique ids"),
+        (torch.tensor([1, 8]), "outside the target vocabulary"),
+    ],
+)
+def test_selector_token_map_validation(token_ids, match):
+    model = SimpleNamespace(candidate_selector=SimpleNamespace(top_k=2))
+    lm_head = SimpleNamespace(weight=torch.randn(6, 2), org_vocab_size=6)
+    with pytest.raises(ValueError, match=match):
+        DFlash2DraftModel.set_selector_token_map(model, token_ids, lm_head)
 
 
 def test_grouped_conv_supports_runtime_block_sizes():
