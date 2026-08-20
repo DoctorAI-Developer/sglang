@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import sglang.srt.models.dflash as dflash_module
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.models.dflash import (
     CandidateSelector,
     DFlash2DraftModel,
@@ -12,6 +13,11 @@ from sglang.srt.models.dflash import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dflash_worker_v2 import (
+    DFlashWorkerV2,
+    _map_reduced_target_top1,
+    _missing_target_top1_ids,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -141,6 +147,86 @@ def test_selector_token_map_validation(token_ids, match):
     lm_head = SimpleNamespace(weight=torch.randn(6, 2), org_vocab_size=6)
     with pytest.raises(ValueError, match=match):
         DFlash2DraftModel.set_selector_token_map(model, token_ids, lm_head)
+
+
+def test_reduced_target_head_projects_only_selected_rows():
+    processor = object.__new__(LogitsProcessor)
+    processor.use_fp32_lm_head = False
+    processor.rl_on_policy_target = None
+    hidden = torch.tensor([[1.0, 2.0], [-1.0, 3.0]])
+    full_weight = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [2.0, 1.0], [-1.0, 2.0]]
+    )
+    selected = full_weight[torch.tensor([0, 2, 3])].contiguous()
+    actual = LogitsProcessor._compute_lm_head(
+        processor,
+        hidden,
+        SimpleNamespace(weight=full_weight),
+        weight_override=selected,
+    )
+    torch.testing.assert_close(actual, hidden @ selected.T)
+    assert actual.shape == (2, 3)
+
+
+def test_reduced_target_top1_restores_global_ids_and_tie_order():
+    global_ids = torch.tensor([3, 11, 29], dtype=torch.int64)
+    logits = torch.tensor([[0.0, 4.0, 1.0], [2.0, 2.0, -1.0]])
+    actual = _map_reduced_target_top1(logits, global_ids)
+    torch.testing.assert_close(actual, torch.tensor([11, 3]))
+
+    with pytest.raises(ValueError, match="width mismatch"):
+        _map_reduced_target_top1(logits, torch.tensor([3, 11]))
+
+
+def test_reduced_target_head_accepts_only_unmodified_greedy_batches():
+    worker = object.__new__(DFlashWorkerV2)
+    worker._use_reduced_target_head = True
+    batch = SimpleNamespace(return_logprob=False, has_grammar=False)
+    sampling_info = SimpleNamespace(
+        is_all_greedy=True,
+        has_custom_logit_processor=False,
+        penalizer_orchestrator=SimpleNamespace(is_required=False),
+        logit_bias=None,
+    )
+    worker._validate_reduced_target_batch(batch, sampling_info)
+
+    ineligible = [
+        ("non-greedy sampling", {"is_all_greedy": False}),
+        ("custom logit processor", {"has_custom_logit_processor": True}),
+        (
+            "sampling penalties",
+            {"penalizer_orchestrator": SimpleNamespace(is_required=True)},
+        ),
+        ("logit bias", {"logit_bias": torch.zeros(1)}),
+    ]
+    for reason, override in ineligible:
+        fields = vars(sampling_info).copy()
+        fields.update(override)
+        with pytest.raises(RuntimeError, match=reason):
+            worker._validate_reduced_target_batch(
+                batch, SimpleNamespace(**fields)
+            )
+
+    with pytest.raises(RuntimeError, match="returned logprobs"):
+        worker._validate_reduced_target_batch(
+            SimpleNamespace(return_logprob=True, has_grammar=False), sampling_info
+        )
+    with pytest.raises(RuntimeError, match="grammar"):
+        worker._validate_reduced_target_batch(
+            SimpleNamespace(return_logprob=False, has_grammar=True), sampling_info
+        )
+
+
+def test_target_top1_audit_reports_only_unmapped_full_head_winners():
+    logits = torch.tensor(
+        [[0.0, 4.0, 1.0, 2.0], [5.0, 1.0, 0.0, 2.0], [0.0, 1.0, 7.0, 3.0]]
+    )
+    selected = torch.tensor([True, True, False, True])
+    actual = _missing_target_top1_ids(logits, selected)
+    torch.testing.assert_close(actual, torch.tensor([2]))
+
+    with pytest.raises(ValueError, match="width mismatch"):
+        _missing_target_top1_ids(logits, torch.ones(3, dtype=torch.bool))
 
 
 def test_grouped_conv_supports_runtime_block_sizes():

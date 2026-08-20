@@ -713,7 +713,17 @@ class LogitsProcessor(nn.Module):
             hidden_states, logits_metadata
         )
 
-        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        dflash_target_weight = (
+            getattr(lm_head, "_dflash_reduced_target_weight", None)
+            if logits_metadata.forward_mode.is_target_verify()
+            else None
+        )
+        logits = self._compute_lm_head(
+            hidden_states,
+            lm_head,
+            embedding_bias,
+            weight_override=dflash_target_weight,
+        )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -754,7 +764,16 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
+        weight_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if weight_override is not None:
+            if embedding_bias is not None:
+                raise RuntimeError(
+                    "The reduced DFLASH target head does not support an lm_head bias."
+                )
+            return torch.matmul(
+                hidden_states.to(weight_override.dtype), weight_override.T
+            )
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method

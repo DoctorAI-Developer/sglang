@@ -176,6 +176,43 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
+def _map_reduced_target_top1(
+    local_logits: torch.Tensor, global_token_ids: torch.Tensor
+) -> torch.Tensor:
+    if local_logits.ndim != 2:
+        raise ValueError(
+            "Reduced target logits must be two-dimensional, "
+            f"got shape={tuple(local_logits.shape)}."
+        )
+    if int(local_logits.shape[-1]) != int(global_token_ids.numel()):
+        raise ValueError(
+            "Reduced target logits/token-map width mismatch: "
+            f"logits={int(local_logits.shape[-1])}, "
+            f"token_map={int(global_token_ids.numel())}."
+        )
+    return global_token_ids[torch.argmax(local_logits, dim=-1)]
+
+
+def _missing_target_top1_ids(
+    full_logits: torch.Tensor, selected_token_mask: torch.Tensor
+) -> torch.Tensor:
+    if full_logits.ndim != 2:
+        raise ValueError(
+            "Full target logits must be two-dimensional, "
+            f"got shape={tuple(full_logits.shape)}."
+        )
+    if selected_token_mask.ndim != 1 or int(selected_token_mask.numel()) != int(
+        full_logits.shape[-1]
+    ):
+        raise ValueError(
+            "Target logits/token-mask width mismatch: "
+            f"logits={int(full_logits.shape[-1])}, "
+            f"token_mask={int(selected_token_mask.numel())}."
+        )
+    target_top1 = torch.argmax(full_logits, dim=-1)
+    return torch.unique(target_top1[~selected_token_mask[target_top1]])
+
+
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
@@ -287,6 +324,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
         self._logged_first_verify = False
+        self._use_reduced_target_head = bool(
+            getattr(server_args, "enable_dflash_reduced_target_head", False)
+        )
+        self._reduced_target_token_ids: Optional[torch.Tensor] = None
+        self._audit_target_top1 = bool(
+            getattr(server_args, "enable_dflash_target_top1_audit", False)
+        )
+        self._target_top1_selected_mask: Optional[torch.Tensor] = None
+        self._target_top1_missing_seen: set[int] = set()
 
         bundle = build_draft_tp_worker(
             server_args=server_args,
@@ -330,6 +376,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id_override,
         )
         target_model = self._target_worker.model_runner.model
+        if self._use_reduced_target_head:
+            self._install_reduced_target_head(target_model)
+        elif self._audit_target_top1:
+            self._install_target_top1_audit(target_model)
         self._noise_embed_scale = (
             float(target_model.get_dflash_noise_embedding_scale())
             if hasattr(target_model, "get_dflash_noise_embedding_scale")
@@ -400,6 +450,101 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+    def _install_reduced_target_head(self, target_model) -> None:
+        lm_head = getattr(target_model, "lm_head", None)
+        if lm_head is None or not is_dense_head_weight(getattr(lm_head, "weight", None)):
+            raise RuntimeError(
+                "The reduced DFLASH target head requires a dense target lm_head."
+            )
+        token_map_path = get_spec().speculative_token_map
+        if token_map_path is None:
+            raise RuntimeError(
+                "The reduced DFLASH target head requires a target token map."
+            )
+        hot_token_id = load_token_map(token_map_path)
+        self.draft_model.set_selector_token_map(hot_token_id, lm_head)
+        reduced_weight = self.draft_model._selector_lm_head_weight
+        reduced_ids = self.draft_model._selector_hot_token_id
+        if reduced_weight is None or reduced_ids is None:
+            raise RuntimeError("Failed to materialize the reduced DFLASH target head.")
+        lm_head._dflash_reduced_target_weight = reduced_weight
+        lm_head._dflash_reduced_target_ids = reduced_ids
+        self._reduced_target_token_ids = reduced_ids
+        if self.ps.tp_rank == 0:
+            logger.warning(
+                "DFLASH reduced greedy TARGET_VERIFY head enabled. tokens=%d, "
+                "copied_head_mib=%.2f, source=%s. Omitted-vocabulary maxima are "
+                "not certified; this path is not production-qualified.",
+                int(reduced_ids.numel()),
+                float(reduced_weight.numel() * reduced_weight.element_size())
+                / (1024**2),
+                token_map_path,
+            )
+
+    def _validate_reduced_target_batch(self, batch, sampling_info) -> None:
+        if not self._use_reduced_target_head:
+            return
+        unsupported = []
+        if not _is_all_greedy(sampling_info):
+            unsupported.append("non-greedy sampling")
+        if batch.return_logprob:
+            unsupported.append("returned logprobs")
+        if batch.has_grammar:
+            unsupported.append("grammar")
+        if sampling_info is not None:
+            if sampling_info.has_custom_logit_processor:
+                unsupported.append("custom logit processor")
+            penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+            if penalizer is not None and penalizer.is_required:
+                unsupported.append("sampling penalties")
+            if getattr(sampling_info, "logit_bias", None) is not None:
+                unsupported.append("logit bias")
+        if unsupported:
+            raise RuntimeError(
+                "The reduced DFLASH target head is ineligible for this batch: "
+                + ", ".join(unsupported)
+                + ". Restart without --enable-dflash-reduced-target-head."
+            )
+
+    def _install_target_top1_audit(self, target_model) -> None:
+        lm_head = getattr(target_model, "lm_head", None)
+        if lm_head is None or not is_dense_head_weight(getattr(lm_head, "weight", None)):
+            raise RuntimeError("The target top-1 audit requires a dense target lm_head.")
+        token_map_path = get_spec().speculative_token_map
+        if token_map_path is None:
+            raise RuntimeError("The target top-1 audit requires a target token map.")
+        token_ids = load_token_map(token_map_path).to(device=lm_head.weight.device)
+        selected_mask = torch.zeros(
+            int(lm_head.weight.shape[0]),
+            dtype=torch.bool,
+            device=lm_head.weight.device,
+        )
+        selected_mask[token_ids] = True
+        self._target_top1_selected_mask = selected_mask
+        if self.ps.tp_rank == 0:
+            logger.warning(
+                "DFLASH target top-1 audit initialized. map_tokens=%d, source=%s. "
+                "Results from this run are not performance measurements.",
+                int(token_ids.numel()),
+                token_map_path,
+            )
+
+    def _audit_full_target_top1(self, full_logits: torch.Tensor) -> None:
+        if not self._audit_target_top1:
+            return
+        assert self._target_top1_selected_mask is not None
+        missing = _missing_target_top1_ids(
+            full_logits, self._target_top1_selected_mask
+        ).tolist()
+        unseen = sorted(set(map(int, missing)) - self._target_top1_missing_seen)
+        if unseen:
+            self._target_top1_missing_seen.update(unseen)
+            logger.warning(
+                "DFLASH_TARGET_TOP1_MAP_MISS new_ids=%s all_missing_ids=%s",
+                unseen,
+                sorted(self._target_top1_missing_seen),
+            )
 
     @property
     def draft_worker(self):
@@ -501,7 +646,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                         f"parallel size 1, got tp_size={tp_size}."
                     )
                 hot_token_id = load_token_map(token_map_path)
-                self.draft_model.set_selector_token_map(hot_token_id, lm_head)
+                if self.draft_model._selector_lm_head_weight is None:
+                    self.draft_model.set_selector_token_map(hot_token_id, lm_head)
                 reduced_weight = self.draft_model._selector_lm_head_weight
                 if self.ps.tp_rank == 0:
                     logger.info(
@@ -1618,6 +1764,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
+        self._validate_reduced_target_batch(batch, sampling_info)
         # A selector draft carries its own q and verifies through accept_sampling, so
         # it never falls back to greedy argmax however this build was compiled.
         if (
@@ -2009,12 +2156,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
 
-        if sampling_info is not None:
+        if sampling_info is not None and not self._use_reduced_target_head:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
             )
+        self._audit_full_target_top1(logits_output.next_token_logits)
 
         # Constrain every chain position before accept picks from it.
         if grammar_mask is not None:
@@ -2046,9 +2194,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
+            if self._use_reduced_target_head:
+                assert self._reduced_target_token_ids is not None
+                target_predict = _map_reduced_target_top1(
+                    logits_output.next_token_logits,
+                    self._reduced_target_token_ids,
+                ).view(bs, int(self.block_size))
+            else:
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, int(self.block_size))
             if self._use_triton_accept_bonus:
                 try:
                     (

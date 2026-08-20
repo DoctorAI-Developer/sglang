@@ -252,6 +252,39 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
             )
 
+    if getattr(server_args, "enable_dflash_reduced_target_head", False):
+        if server_args.speculative_token_map is None:
+            raise ValueError(
+                "--enable-dflash-reduced-target-head requires "
+                "--speculative-token-map."
+            )
+        if int(server_args.tp_size) != 1:
+            raise ValueError(
+                "--enable-dflash-reduced-target-head currently requires tensor "
+                f"parallel size 1, got tp_size={server_args.tp_size}."
+            )
+        logger.warning(
+            "The reduced DFLASH target head is an isolated greedy-only research "
+            "path. Sampling, penalties, grammar, custom processors, and returned "
+            "logprobs fail closed."
+        )
+
+    if getattr(server_args, "enable_dflash_target_top1_audit", False):
+        if server_args.speculative_token_map is None:
+            raise ValueError(
+                "--enable-dflash-target-top1-audit requires "
+                "--speculative-token-map."
+            )
+        if getattr(server_args, "enable_dflash_reduced_target_head", False):
+            raise ValueError(
+                "--enable-dflash-target-top1-audit requires the full target head; "
+                "disable --enable-dflash-reduced-target-head."
+            )
+        logger.warning(
+            "DFLASH full-head target top-1 audit enabled. Device-to-host logging "
+            "synchronizes verification and invalidates performance measurements."
+        )
+
     _resolve_dflash_draft_attention_backend(server_args)
 
     if server_args.max_running_requests is None:
