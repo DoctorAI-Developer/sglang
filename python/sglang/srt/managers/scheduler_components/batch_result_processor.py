@@ -16,6 +16,10 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.customized_info_utils import (
+    append_dflash_reject_token_mask,
+    append_dflash_rejected_draft_metadata,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_MATCHED_TOKEN,
@@ -946,6 +950,23 @@ class SchedulerBatchResultProcessor:
 
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
+
+            rejected_metadata = result.dflash_rejected_draft_metadata
+            if rejected_metadata is not None:
+                append_dflash_reject_token_mask(
+                    req,
+                    new_accept_len,
+                    output_ids_already_updated=True,
+                )
+                append_dflash_rejected_draft_metadata(
+                    req,
+                    new_accept_len,
+                    anchor_index=len(req.output_ids) - new_accept_len - 1,
+                    offsets=rejected_metadata["offsets"][i],
+                    token_ids=rejected_metadata["token_ids"][i],
+                    teacher_logprobs=rejected_metadata["teacher_logprobs"][i],
+                    output_ids_already_updated=True,
+                )
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()

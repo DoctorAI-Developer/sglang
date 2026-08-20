@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.customized_info_utils import extend_customized_info_chunk
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -2303,9 +2304,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ]
                 if customized_info is not None:
                     for k, v in customized_info.items():
-                        if k not in state.customized_info_accumulated:
-                            state.customized_info_accumulated[k] = []
-                        state.customized_info_accumulated[k].extend(v[i])
+                        extend_customized_info_chunk(
+                            state.customized_info_accumulated, k, v[i]
+                        )
                         meta_info[k] = state.customized_info_accumulated[k]
 
                 # Add multimodal prompt token counts only for requests that

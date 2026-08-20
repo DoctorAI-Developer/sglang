@@ -45,7 +45,9 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
+    build_dflash_rejected_draft_metadata,
     can_dflash_use_fused_qkv_proj,
+    compute_dflash_candidate_logprobs,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dense_head_weight,
@@ -457,6 +459,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._target_projection_done: Optional[torch.cuda.Event] = None
         self._target_top1_selected_mask: Optional[torch.Tensor] = None
         self._target_top1_missing_seen: set[int] = set()
+        self.enable_dflash_opd_metadata = bool(server_args.enable_dflash_opd_metadata)
 
         bundle = build_draft_tp_worker(
             server_args=server_args,
@@ -2603,6 +2606,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         new_seq_lens = None
         target_predict = None
+        use_sampling_distribution = False
         tree_accept_index = None
         if self.selector_tree_budget:
             if self._use_reduced_target_head:
@@ -2660,6 +2664,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_input=draft_input,
             )
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+            use_sampling_distribution = True
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
@@ -2671,6 +2676,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+            use_sampling_distribution = True
         else:
             if self._use_reduced_target_head:
                 assert self._reduced_target_token_ids is not None
@@ -2748,6 +2754,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+
+        rejected_draft_metadata = None
+        if self.enable_dflash_opd_metadata:
+            candidate_teacher_logprobs = compute_dflash_candidate_logprobs(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                use_sampling_distribution=use_sampling_distribution,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+            rejected_draft_metadata = build_dflash_rejected_draft_metadata(
+                candidates=candidates,
+                candidate_teacher_logprobs=candidate_teacher_logprobs,
+                accept_len=accept_len,
+            )
 
         if batch.return_logprob:
             compute_spec_logprobs(
@@ -2834,6 +2856,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
+            dflash_rejected_draft_metadata=rejected_draft_metadata,
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
         )

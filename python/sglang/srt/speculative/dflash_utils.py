@@ -1036,6 +1036,134 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
+def compute_dflash_candidate_logprobs(
+    *,
+    candidates: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    use_sampling_distribution: bool,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+) -> torch.Tensor:
+    """Return verifier log-probabilities for draft candidates at offsets 1..N.
+
+    The logits must already contain the same custom processors, penalties,
+    biases, and grammar mask used by verification. Sampling requests then use
+    the exact temperature/top-k/top-p target distribution; greedy requests use
+    the post-adjustment categorical distribution for a finite teacher signal.
+    """
+    if candidates.ndim != 2:
+        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
+    if next_token_logits.ndim != 2:
+        raise ValueError(
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
+        )
+
+    bs, draft_token_num = candidates.shape
+    expected_rows = bs * draft_token_num
+    if next_token_logits.shape[0] != expected_rows:
+        raise ValueError(
+            "next_token_logits row count mismatch. "
+            f"Expected {expected_rows}, got {next_token_logits.shape[0]}."
+        )
+    if candidates.device != next_token_logits.device:
+        raise ValueError(
+            "candidates and next_token_logits must be on the same device, "
+            f"got {candidates.device} and {next_token_logits.device}."
+        )
+    if draft_token_num <= 1:
+        return next_token_logits.new_empty((bs, 0), dtype=torch.float32)
+
+    if use_sampling_distribution:
+        if sampling_info is None:
+            raise ValueError(
+                "sampling_info is required when use_sampling_distribution=True."
+            )
+        probs = build_dflash_verify_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=draft_token_num,
+            bs=bs,
+            max_top_k=max_top_k,
+            uniform_top_k_value=uniform_top_k_value,
+        )
+        # Preserve zero-mass labels as a finite value for serialization. The
+        # trainer sees the same floor used by the official Draft-OPD collector.
+        log_probs = torch.log(probs.clamp_min(torch.finfo(probs.dtype).tiny))
+    else:
+        log_probs = F.log_softmax(next_token_logits.float(), dim=-1).view(
+            bs, draft_token_num, -1
+        )
+
+    candidate_token_ids = candidates[:, 1:].to(dtype=torch.long)
+    return (
+        log_probs[:, :-1, :]
+        .gather(dim=-1, index=candidate_token_ids.unsqueeze(-1))
+        .squeeze(-1)
+    )
+
+
+def build_dflash_rejected_draft_metadata(
+    *,
+    candidates: torch.Tensor,
+    candidate_teacher_logprobs: torch.Tensor,
+    accept_len: torch.Tensor,
+) -> dict[str, list[list[Any]]]:
+    """Serialize rejected proposal suffixes for each verifier row.
+
+    ``accept_len`` excludes the correction/bonus token. For a block with N
+    proposals, row ``accept_len`` is therefore the first rejected proposal and
+    its one-based block offset is ``accept_len + 1``.
+    """
+    if candidates.ndim != 2:
+        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
+    bs, draft_token_num = candidates.shape
+    expected_logprob_shape = (bs, max(0, draft_token_num - 1))
+    if tuple(candidate_teacher_logprobs.shape) != expected_logprob_shape:
+        raise ValueError(
+            "candidate_teacher_logprobs shape mismatch. "
+            f"Expected {expected_logprob_shape}, got "
+            f"{tuple(candidate_teacher_logprobs.shape)}."
+        )
+    if accept_len.numel() != bs:
+        raise ValueError(
+            f"accept_len must contain {bs} values, got {accept_len.numel()}."
+        )
+
+    metadata: dict[str, list[list[Any]]] = {
+        "offsets": [[] for _ in range(bs)],
+        "token_ids": [[] for _ in range(bs)],
+        "teacher_logprobs": [[] for _ in range(bs)],
+    }
+    max_accept_len = draft_token_num - 1
+    if max_accept_len <= 0:
+        return metadata
+
+    candidate_suffix_cpu = candidates[:, 1:].detach().cpu()
+    teacher_suffix_cpu = candidate_teacher_logprobs.detach().cpu()
+    accept_len_cpu = accept_len.detach().cpu().reshape(-1).tolist()
+    for row_index, accepted in enumerate(accept_len_cpu):
+        accepted = int(accepted)
+        if accepted < 0 or accepted > max_accept_len:
+            raise ValueError(
+                f"accept_len[{row_index}]={accepted} is outside [0, {max_accept_len}]."
+            )
+        if accepted == max_accept_len:
+            continue
+        metadata["offsets"][row_index] = list(range(accepted + 1, draft_token_num))
+        metadata["token_ids"][row_index] = [
+            int(value)
+            for value in candidate_suffix_cpu[
+                row_index, accepted:max_accept_len
+            ].tolist()
+        ]
+        metadata["teacher_logprobs"][row_index] = [
+            float(value)
+            for value in teacher_suffix_cpu[row_index, accepted:max_accept_len].tolist()
+        ]
+    return metadata
+
+
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."

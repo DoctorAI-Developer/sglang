@@ -92,6 +92,10 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
+    # Collection-only DFlash2 on-policy-distillation metadata. Values are CPU
+    # lists so overlap result processing does not need another device transfer.
+    dflash_rejected_draft_metadata: Optional[dict[str, list[list[Any]]]] = None
+
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).

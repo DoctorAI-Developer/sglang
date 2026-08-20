@@ -103,6 +103,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         kwargs=kwargs,
     )
 
+    if (
+        server_args.enable_dflash_opd_metadata
+        and server_args.speculative_algorithm != "DFLASH"
+    ):
+        raise ValueError(
+            "--enable-dflash-opd-metadata requires "
+            "--speculative-algorithm DFLASH."
+        )
+
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
     if server_args.speculative_draft_window_size is not None:
@@ -167,6 +176,28 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         raise ValueError(
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
+
+    if server_args.enable_dflash_opd_metadata:
+        from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
+
+        if SIMULATE_ACC_LEN > 0:
+            raise ValueError(
+                "--enable-dflash-opd-metadata cannot be combined with "
+                "SGLANG_SIMULATE_ACC_LEN: simulated acceptance would corrupt "
+                "on-policy distillation labels."
+            )
+        if server_args.dflash_selector_tree_budget is not None:
+            raise ValueError(
+                "--enable-dflash-opd-metadata cannot be combined with "
+                "--dflash-selector-tree-budget: the replay schema describes "
+                "linear rejected suffixes, not branching verifier trees."
+            )
+        if server_args.enable_dflash_reduced_target_head:
+            raise ValueError(
+                "--enable-dflash-opd-metadata cannot be combined with "
+                "--enable-dflash-reduced-target-head: replay supervision "
+                "requires full-vocabulary verifier log-probabilities."
+            )
 
     # Linear DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields
     # still affect generic scheduler/KV-cache and attention-backend setup.  The

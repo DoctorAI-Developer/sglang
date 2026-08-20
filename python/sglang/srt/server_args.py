@@ -2134,6 +2134,11 @@ class ServerArgs:
         "cumulative-probability policy.",
         NS("spec"),
     ] = None
+    enable_dflash_opd_metadata: A[
+        bool,
+        "DFLASH only. Return exact rejected-suffix verifier metadata for offline on-policy distillation. Collection adds device-to-host synchronization and is disabled by default.",
+        NS("spec"),
+    ] = False
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

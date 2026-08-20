@@ -12,7 +12,12 @@ from sglang.srt.models.dflash import (
     _grouped_conv,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dflash_utils import (
+    build_dflash_rejected_draft_metadata,
+    build_dflash_verify_target_probs,
+    compute_dflash_candidate_logprobs,
+    parse_dflash_draft_config,
+)
 from sglang.srt.speculative.dflash_worker_v2 import (
     DFlashWorkerV2,
     _map_reduced_target_top1,
@@ -371,6 +376,100 @@ def test_grouped_conv_supports_runtime_block_sizes():
                     value += coefficient * hidden_3d[batch, position - tap]
                 expected[batch * block_size + position] = value.flatten()
         torch.testing.assert_close(actual, expected)
+
+
+def test_dflash_candidate_logprobs_match_greedy_verifier_rows():
+    candidates = torch.tensor([[7, 2, 1]])
+    logits = torch.tensor(
+        [
+            [0.0, 1.0, 2.0],
+            [3.0, 2.0, 1.0],
+            [-1.0, 0.0, 1.0],
+        ]
+    )
+
+    actual = compute_dflash_candidate_logprobs(
+        candidates=candidates,
+        next_token_logits=logits,
+        sampling_info=None,
+        use_sampling_distribution=False,
+    )
+    expected = torch.stack(
+        [
+            torch.log_softmax(logits[0], dim=-1)[2],
+            torch.log_softmax(logits[1], dim=-1)[1],
+        ]
+    ).unsqueeze(0)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_dflash_candidate_logprobs_match_top_k_sampling_distribution():
+    candidates = torch.tensor([[7, 2, 1]])
+    logits = torch.tensor(
+        [
+            [0.0, 1.0, 2.0],
+            [3.0, 2.0, 1.0],
+            [-1.0, 0.0, 1.0],
+        ]
+    )
+    sampling_info = SimpleNamespace(
+        temperatures=torch.tensor([[0.75]]),
+        top_ks=torch.tensor([2]),
+        top_ps=torch.tensor([1.0]),
+        need_top_k_sampling=True,
+        # The CPU unit-test environment may have CUDA-only FlashInfer renorm
+        # symbols installed. Top-p is exercised by the shared target-probability
+        # builder on GPU; this analytic test keeps the exact sparse top-k path.
+        need_top_p_sampling=False,
+    )
+
+    actual = compute_dflash_candidate_logprobs(
+        candidates=candidates,
+        next_token_logits=logits,
+        sampling_info=sampling_info,
+        use_sampling_distribution=True,
+        max_top_k=2,
+        uniform_top_k_value=2,
+    )
+    probs = build_dflash_verify_target_probs(
+        next_token_logits=logits,
+        sampling_info=sampling_info,
+        draft_token_num=3,
+        bs=1,
+        max_top_k=2,
+        uniform_top_k_value=2,
+    )
+    expected = torch.stack(
+        [
+            probs[0, 0, 2].clamp_min(torch.finfo(probs.dtype).tiny).log(),
+            probs[0, 1, 1].clamp_min(torch.finfo(probs.dtype).tiny).log(),
+        ]
+    ).unsqueeze(0)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_dflash_rejected_suffix_starts_at_first_unaccepted_proposal():
+    metadata = build_dflash_rejected_draft_metadata(
+        candidates=torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]]),
+        candidate_teacher_logprobs=torch.tensor(
+            [[-0.1, -0.2, -0.3], [-1.1, -1.2, -1.3]]
+        ),
+        accept_len=torch.tensor([1, 3]),
+    )
+
+    assert metadata["offsets"] == [[2, 3], []]
+    assert metadata["token_ids"] == [[12, 13], []]
+    assert metadata["teacher_logprobs"][0] == pytest.approx([-0.2, -0.3])
+    assert metadata["teacher_logprobs"][1] == []
+
+
+def test_dflash_rejected_suffix_rejects_invalid_accept_length():
+    with pytest.raises(ValueError, match="outside"):
+        build_dflash_rejected_draft_metadata(
+            candidates=torch.tensor([[10, 11, 12]]),
+            candidate_teacher_logprobs=torch.tensor([[-0.1, -0.2]]),
+            accept_len=torch.tensor([3]),
+        )
 
 
 if __name__ == "__main__":
