@@ -34,7 +34,8 @@ using RouteQuantTraitT = QuantTrait<
     /*kUe8m0=*/true,
     /*kRowMajor=*/true,
     /*kAligned=*/true,
-    /*kFuseSiluAndMul=*/false>;
+    /*kFuseSiluAndMul=*/false,
+    /*kRoundSiluActivation=*/true>;
 
 using RouteQuantTrait = RouteQuantTraitT<bf16_t>;
 

@@ -30,6 +30,7 @@ def _jit_module(
     row_major: bool,
     aligned: bool,
     fuse_silu_and_mul: bool,
+    round_silu_activation: bool,
     masked_layout: bool,
     use_pdl: bool,
 ) -> Module:
@@ -44,6 +45,7 @@ def _jit_module(
         row_major,
         aligned,
         fuse_silu_and_mul,
+        round_silu_activation,
         use_pdl,
     )
     launcher = (
@@ -93,6 +95,7 @@ def _per_token_group_quant_custom_op(
     group_size: int,
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
+    round_silu_activation: bool = True,
     masked_m: Optional[torch.Tensor] = None,
     expected_m: Optional[int] = None,
 ) -> None:
@@ -106,6 +109,7 @@ def _per_token_group_quant_custom_op(
         row_major,
         aligned,
         bool(fuse_silu_and_mul),
+        bool(round_silu_activation),
         masked_m is not None,
         is_arch_support_pdl(),
     )
@@ -166,6 +170,7 @@ def per_token_group_quant(
     group_size: int = 128,
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
+    round_silu_activation: bool = True,
     masked_m: Optional[torch.Tensor] = None,
     expected_m: Optional[int] = None,
     *,
@@ -194,9 +199,16 @@ def per_token_group_quant(
 
     ``expected_m`` (masked only) is an optional expected-tokens-per-expert hint.
 
+    With ``fuse_silu_and_mul=True``, ``round_silu_activation=True`` preserves
+    the historical fused-MoE behavior (round SiLU before multiplication).
+    Set it to ``False`` to match dense SiLUAndMul, which rounds only the final
+    SiLU-times-up product before quantization.
+
     Inputs are bf16/fp16; group size is one of 16/32/64/128/256; the quant range
     follows ``output_q.dtype`` (fp8_e4m3: +-448, int8: [-128, 127]).
     """
+    if not fuse_silu_and_mul and not round_silu_activation:
+        raise ValueError("round_silu_activation=False requires fuse_silu_and_mul=True")
     if output_q is None:
         assert output_s is None
         output_q, output_s = _allocate_outputs(
@@ -217,6 +229,7 @@ def per_token_group_quant(
         group_size=group_size,
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
+        round_silu_activation=round_silu_activation,
         masked_m=masked_m,
         expected_m=expected_m,
     )

@@ -218,7 +218,8 @@ template <
     bool kUe8m0_,
     bool kRowMajor_,
     bool kAligned_,
-    bool kFuseSiluAndMul_>
+    bool kFuseSiluAndMul_,
+    bool kRoundSiluActivation_>
 struct QuantTrait {
   // rename
   using InputType = InputType_;
@@ -228,6 +229,7 @@ struct QuantTrait {
   static constexpr bool kRowMajor = kRowMajor_;
   static constexpr bool kAligned = kAligned_;
   static constexpr bool kFuseSiluAndMul = kFuseSiluAndMul_;
+  static constexpr bool kRoundSiluActivation = kRoundSiluActivation_;
   static constexpr uint32_t kBlockSize = 256;
   static constexpr uint32_t kVecSize = 32u / 2;
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
@@ -282,8 +284,17 @@ struct QuantTrait {
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
         const auto gate = cast<float2>(in[i]);
-        const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
-        in[i] = __hmul2(act, up[i]);
+        const auto act = float2{detail::silu(gate.x), detail::silu(gate.y)};
+        if constexpr (kRoundSiluActivation) {
+          // Historical fused-MoE behavior: round SiLU to the input dtype
+          // before multiplying. Keep this as the default for existing users.
+          in[i] = __hmul2(cast<T2>(act), up[i]);
+        } else {
+          // Dense Qwen SiLUAndMul rounds only the final product to BF16. Do
+          // both operations in fp32 and cast once so fusing quantization does
+          // not alter the activation tensor that the unfused path quantizes.
+          in[i] = cast<T2>(detail::mul2(act, cast<float2>(up[i])));
+        }
       }
     }
 
@@ -570,9 +581,18 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
+    bool kRoundSiluActivation,
     bool kUsePDL>
 struct PerTokenGroupQuantFlatKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait = QuantTrait<
+      InputType,
+      QuantType,
+      kGroupSize,
+      kUe8m0,
+      kRowMajor,
+      kAligned,
+      kFuseSiluAndMul,
+      kRoundSiluActivation>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     using namespace host;
@@ -594,9 +614,18 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
+    bool kRoundSiluActivation,
     bool kUsePDL>
 struct PerTokenGroupQuantMaskedKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait = QuantTrait<
+      InputType,
+      QuantType,
+      kGroupSize,
+      kUe8m0,
+      kRowMajor,
+      kAligned,
+      kFuseSiluAndMul,
+      kRoundSiluActivation>;
 
   // expected_m: optional host-side expected-tokens-per-expert hint (the same
   // hint SGLang passes to deep_gemm's masked grouped GEMM); <= 0 means

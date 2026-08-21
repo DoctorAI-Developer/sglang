@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
+from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
@@ -333,6 +334,37 @@ def test_fused_silu(scale_ue8m0, column_major):
 
     deq_scale = _packed_exp_to_dequant_scale(x_s, hidden // G) if scale_ue8m0 else x_s
     assert _dequant_rel_err(x_q, deq_scale, act, G) < 0.05
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 13])
+def test_fused_silu_dense_output_rounding_is_bit_exact(num_tokens):
+    """The dense-Qwen mode must exactly replace separate SiLUAndMul + quant.
+
+    Both kernels compile with the SM90 fast-math policy. Comparing their FP8
+    bytes and FP32 TMA scale buffers bit-for-bit pins the activation rounding
+    point as well as the downstream quantization expression order.
+    """
+    torch.manual_seed(20260821 + num_tokens)
+    hidden = 17_408
+    x = torch.randn(num_tokens, hidden * 2, device="cuda", dtype=torch.bfloat16)
+
+    activated = silu_and_mul(x)
+    q_ref, s_ref = per_token_group_quant(
+        activated,
+        group_size=G,
+        column_major_scales=True,
+    )
+    q_fused, s_fused = per_token_group_quant(
+        x,
+        group_size=G,
+        fuse_silu_and_mul=True,
+        round_silu_activation=False,
+        column_major_scales=True,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(q_fused.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s_fused, s_ref)
 
 
 # --------------------------------------------------------------------------- #

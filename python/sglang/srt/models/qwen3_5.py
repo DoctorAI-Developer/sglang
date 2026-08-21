@@ -28,6 +28,9 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.quantization.per_token_group_quant import (
+    per_token_group_quant,
+)
 
 # Configs
 from sglang.srt.configs.qwen3_5 import (
@@ -65,6 +68,10 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    deepgemm_w8a8_block_fp8_linear_with_fallback,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -284,6 +291,115 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
+
+
+@lru_cache(maxsize=1)
+def _enable_qwen35_silu_fp8_quant_fusion() -> bool:
+    """Opt in to dense SiLUAndMul + block-FP8 activation quantization fusion.
+
+    This stays off by default until a deployment explicitly selects it. The
+    installation helper below independently checks every runtime assumption,
+    so setting the environment variable on an unsupported configuration is a
+    no-op rather than a numerical or backend change.
+    """
+    return get_bool_env_var(
+        "SGLANG_ENABLE_QWEN35_SILU_FP8_QUANT_FUSION", default="false"
+    )
+
+
+class _Qwen35SiluFp8QuantFusion(nn.Module):
+    """Produce the pre-quantized tuple consumed by a DeepGEMM down projection.
+
+    The fused kernel's dense-output-rounding mode is bit-exact with Qwen's
+    separate CUDA SiLUAndMul followed by block-128 activation quantization on
+    SM90. Runtime metadata that differs from the qualified shape falls back to
+    the original activation module.
+    """
+
+    def __init__(self, fallback: nn.Module, hidden_size: int) -> None:
+        super().__init__()
+        self.fallback = fallback
+        self.hidden_size = int(hidden_size)
+
+    def forward(self, gate_up: torch.Tensor):
+        if (
+            not gate_up.is_cuda
+            or gate_up.dtype != torch.bfloat16
+            or not gate_up.is_contiguous()
+            or gate_up.ndim < 2
+            or gate_up.shape[-1] != self.hidden_size * 2
+        ):
+            return self.fallback(gate_up)
+        return per_token_group_quant(
+            gate_up,
+            group_size=128,
+            fuse_silu_and_mul=True,
+            round_silu_activation=False,
+            column_major_scales=True,
+        )
+
+
+@lru_cache(maxsize=None)
+def _log_qwen35_silu_fp8_quant_fusion(enabled: bool, reason: str) -> None:
+    if enabled:
+        logger.info("Enabled Qwen dense SiLU + block-FP8 quant fusion (%s).", reason)
+    else:
+        logger.warning(
+            "Qwen dense SiLU + block-FP8 quant fusion was requested but not "
+            "enabled (%s).",
+            reason,
+        )
+
+
+def _maybe_enable_qwen35_silu_fp8_quant_fusion(mlp: nn.Module) -> bool:
+    """Install the SM90/DeepGEMM fusion only for the qualified target path."""
+    if not _enable_qwen35_silu_fp8_quant_fusion():
+        return False
+
+    reason = None
+    if not _is_cuda:
+        reason = "CUDA is required"
+    elif not isinstance(mlp, Qwen2MoeMLP):
+        reason = "dense Qwen MLP is required"
+    elif get_parallel().tp_size != 1:
+        reason = "the initial qualified implementation is TP=1 only"
+    else:
+        quant_method = getattr(getattr(mlp, "down_proj", None), "quant_method", None)
+        if not isinstance(quant_method, Fp8LinearMethod):
+            reason = "down_proj is not using Fp8LinearMethod"
+        elif not quant_method.block_quant or quant_method.use_mxfp8:
+            reason = "block FP8 (not MXFP8) is required"
+        elif list(quant_method.weight_block_size or []) != [128, 128]:
+            reason = "weight_block_size must be [128, 128]"
+        elif (
+            quant_method.w8a8_block_fp8_linear
+            is not deepgemm_w8a8_block_fp8_linear_with_fallback
+        ):
+            reason = "the dense FP8 backend is not DeepGEMM"
+        else:
+            from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+                DEEPGEMM_SCALE_UE8M0,
+            )
+
+            if DEEPGEMM_SCALE_UE8M0:
+                reason = "the initial implementation requires FP32 DeepGEMM scales"
+
+    if reason is not None:
+        _log_qwen35_silu_fp8_quant_fusion(False, reason)
+        return False
+
+    hidden_size = int(mlp.down_proj.input_size_per_partition)
+    if hidden_size % 128 != 0:
+        _log_qwen35_silu_fp8_quant_fusion(
+            False, f"down_proj width {hidden_size} is not block-128 aligned"
+        )
+        return False
+
+    mlp.act_fn = _Qwen35SiluFp8QuantFusion(mlp.act_fn, hidden_size)
+    _log_qwen35_silu_fp8_quant_fusion(
+        True, f"hidden={hidden_size}, block=128, TP=1, FP32 TMA scales"
+    )
+    return True
 
 
 if _is_npu:
@@ -817,6 +933,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
+            _maybe_enable_qwen35_silu_fp8_quant_fusion(self.mlp)
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
@@ -1018,6 +1135,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
+            _maybe_enable_qwen35_silu_fp8_quant_fusion(self.mlp)
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
