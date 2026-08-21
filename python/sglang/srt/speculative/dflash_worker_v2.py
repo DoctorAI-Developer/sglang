@@ -281,12 +281,20 @@ class _SelectorDraftSampler:
     """
 
     def __init__(
-        self, *, draft_model, block_size, max_bs, device, selector_tree_budget=0
+        self,
+        *,
+        draft_model,
+        block_size,
+        max_bs,
+        device,
+        selector_tree_budget=0,
+        selector_tree_depth_log_bias=0.0,
     ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
         self.selector_tree_budget = int(selector_tree_budget)
+        self.selector_tree_depth_log_bias = float(selector_tree_depth_log_bias)
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
         output_width = max(gamma, self.selector_tree_budget)
         self.out = torch.empty(
@@ -377,6 +385,7 @@ class _SelectorDraftSampler:
                 depth_out=self.tree_depth[:bs],
                 candidate_index_out=self.tree_candidate_index[:bs],
                 cumulative_out=self.tree_cumulative[:bs],
+                depth_log_bias=self.selector_tree_depth_log_bias,
             )
             return
         # In-graph philox draw: each replay advances the generator and redraws.
@@ -465,6 +474,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.selector_tree_budget = int(
             getattr(server_args, "dflash_selector_tree_budget", None) or 0
         )
+        self.selector_tree_depth_log_bias = float(
+            getattr(server_args, "dflash_selector_tree_depth_log_bias", None) or 0.0
+        )
         self._selector_tree: Optional[DFlashSelectorTree] = None
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -547,11 +559,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self.selector_tree_budget:
                 logger.warning(
                     "DFLASH2 predecessor-conditioned selector tree active. "
-                    "non_root_budget=%d, draft_rows=%d, verify_rows=%d, top_k=%d.",
+                    "non_root_budget=%d, draft_rows=%d, verify_rows=%d, top_k=%d, "
+                    "depth_log_bias=%s.",
                     self.selector_tree_budget,
                     self.block_size,
                     self.verify_width,
                     int(self.selector.top_k),
+                    self.selector_tree_depth_log_bias,
                 )
 
         self._block_pos_offsets = build_block_pos_offsets(
@@ -908,6 +922,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
                 selector_tree_budget=self.selector_tree_budget,
+                selector_tree_depth_log_bias=self.selector_tree_depth_log_bias,
             )
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
@@ -1376,6 +1391,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 candidate_ids,
                 scores,
                 budget=self.selector_tree_budget,
+                depth_log_bias=self.selector_tree_depth_log_bias,
             )
             return self._selector_tree.draft_tokens
         device = pred_hidden.device

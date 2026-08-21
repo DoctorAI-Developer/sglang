@@ -14,6 +14,7 @@ non-root nodes (eight target verification rows including the root).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -113,6 +114,7 @@ def build_dflash_selector_tree_reference(
     candidate_ids: torch.Tensor,
     edge_scores: torch.Tensor,
     budget: int,
+    depth_log_bias: float = 0.0,
 ) -> DFlashSelectorTree:
     """Deterministic CPU reference for the best-first Markov selector tree."""
     if candidate_ids.ndim != 3:
@@ -127,6 +129,8 @@ def build_dflash_selector_tree_reference(
         raise ValueError("candidate_ids must use torch.int64")
     if budget <= 0:
         raise ValueError("tree budget must be positive")
+    if not math.isfinite(depth_log_bias):
+        raise ValueError("depth_log_bias must be finite")
     if depth_limit <= 0 or top_k <= 0:
         raise ValueError("candidate lattice dimensions must be positive")
     if budget > depth_limit * top_k:
@@ -160,10 +164,10 @@ def build_dflash_selector_tree_reference(
             eligible = [entry for entry in frontier if (entry[2], entry[4]) not in used]
             if not eligible:
                 raise RuntimeError("selector tree frontier was exhausted")
-            score, depth_index, parent, predecessor, child = min(
+            score, depth_index, parent, _predecessor, child = min(
                 eligible,
                 key=lambda entry: (
-                    -entry[0],
+                    -(entry[0] + (entry[1] + 1) * depth_log_bias),
                     entry[1],
                     entry[2],
                     int(ids[b, entry[1], entry[4]]),
@@ -188,8 +192,7 @@ def build_dflash_selector_tree_reference(
                 for next_child in range(top_k):
                     frontier.append(
                         (
-                            score
-                            + float(log_probs[b, next_depth, child, next_child]),
+                            score + float(log_probs[b, next_depth, child, next_child]),
                             next_depth,
                             node,
                             child,
@@ -233,6 +236,7 @@ def _dflash_selector_tree_kernel(
     top_k: tl.constexpr,
     budget: tl.constexpr,
     frontier_block: tl.constexpr,
+    depth_log_bias: tl.constexpr,
 ):
     """One program per request; all frontier state remains in registers."""
     batch_idx = tl.program_id(0)
@@ -309,6 +313,9 @@ def _dflash_selector_tree_kernel(
             ).to(tl.float32)
             row_sum += tl.where(valid, tl.exp(value - row_max), 0.0)
         cumulative_score = parent_cumulative + edge_score - row_max - tl.log(row_sum)
+        selection_score = (
+            cumulative_score + (next_depth + 1).to(tl.float32) * depth_log_bias
+        )
 
         # An edge is uniquely identified by (parent node, local child).  Mask
         # every edge already admitted in an earlier iteration.
@@ -328,10 +335,10 @@ def _dflash_selector_tree_kernel(
             other=2**30,
         ).to(tl.int32)
 
-        # Match the CPU/oracle heap ordering for deterministic score ties:
-        # cumulative probability desc, depth, parent, token id, child index.
-        best_score = tl.max(tl.where(valid, cumulative_score, -float("inf")))
-        tied = valid & (cumulative_score == best_score)
+        # Match the CPU/oracle heap ordering for deterministic priority ties:
+        # calibrated score desc, depth, parent, token id, child index.
+        best_score = tl.max(tl.where(valid, selection_score, -float("inf")))
+        tied = valid & (selection_score == best_score)
         best_depth = tl.min(tl.where(tied, next_depth, 2**30))
         tied &= next_depth == best_depth
         best_parent = tl.min(tl.where(tied, parent_slot, 2**30))
@@ -339,13 +346,15 @@ def _dflash_selector_tree_kernel(
         best_token = tl.min(tl.where(tied, candidate_token, 2**30))
         tied &= candidate_token == best_token
         best_child = tl.min(tl.where(tied, child, 2**30))
+        chosen = tied & (child == best_child)
+        best_cumulative = tl.max(tl.where(chosen, cumulative_score, -float("inf")))
 
         synthetic_index = best_parent * top_k + best_child
         tl.store(draft_tokens_ptr + out_base + iteration, best_token)
         tl.store(parent_ptr + out_base + iteration, best_parent)
         tl.store(depth_ptr + out_base + iteration, best_depth + 1)
         tl.store(candidate_index_ptr + out_base + iteration, best_child)
-        tl.store(cumulative_ptr + out_base + iteration, best_score)
+        tl.store(cumulative_ptr + out_base + iteration, best_cumulative)
         tl.store(selected_index_ptr + out_base + iteration, synthetic_index)
         # Entry ``node`` describes that node's own synthetic selected index;
         # descendants divide their selected index by top_k to find this slot.
@@ -363,6 +372,7 @@ def _build_dflash_selector_tree_triton_unchecked(
     depth_out: torch.Tensor,
     candidate_index_out: torch.Tensor,
     cumulative_out: torch.Tensor,
+    depth_log_bias: float = 0.0,
 ) -> None:
     """Launch into caller-owned static outputs (safe inside CUDA Graph capture)."""
     batch, depth_limit, top_k = map(int, candidate_ids.shape)
@@ -392,6 +402,7 @@ def _build_dflash_selector_tree_triton_unchecked(
         top_k=top_k,
         budget=budget,
         frontier_block=frontier_block,
+        depth_log_bias=depth_log_bias,
         num_warps=4,
     )
 
@@ -400,6 +411,7 @@ def build_dflash_selector_tree_triton(
     candidate_ids: torch.Tensor,
     edge_scores: torch.Tensor,
     budget: int,
+    depth_log_bias: float = 0.0,
 ) -> DFlashSelectorTree:
     """Validated allocating wrapper used by tests and eager execution."""
     if not candidate_ids.is_cuda or not edge_scores.is_cuda:
@@ -413,6 +425,8 @@ def build_dflash_selector_tree_triton(
         raise ValueError("candidate_ids must use torch.int64")
     if budget <= 0 or budget > depth_limit * top_k:
         raise ValueError("tree budget must be in [1, depth * top_k]")
+    if not math.isfinite(depth_log_bias):
+        raise ValueError("depth_log_bias must be finite")
 
     device = candidate_ids.device
     tokens = torch.empty((batch, budget), dtype=torch.int64, device=device)
@@ -432,6 +446,7 @@ def build_dflash_selector_tree_triton(
         depth_out=depth,
         candidate_index_out=child,
         cumulative_out=cumulative,
+        depth_log_bias=depth_log_bias,
     )
     return DFlashSelectorTree(
         draft_tokens=tokens,

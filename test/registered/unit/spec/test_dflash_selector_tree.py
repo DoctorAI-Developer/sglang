@@ -1,20 +1,18 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import pytest
 import torch
-
-from sglang.srt.models.qwen3_5 import (
-    _DFlashProjectedCapture,
-)
+from sglang.srt.models.qwen3_5 import _DFlashProjectedCapture
 from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative.dflash_worker_v2 import (
-    _SelectorDraftSampler,
-    _compact_tree_nodes_to_front,
-)
 from sglang.srt.speculative.dflash_tree import (
     build_dflash_selector_tree_reference,
+)
+from sglang.srt.speculative.dflash_worker_v2 import (
+    _compact_tree_nodes_to_front,
+    _SelectorDraftSampler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -58,6 +56,27 @@ def test_reference_tree_ties_are_deterministic_by_token_id() -> None:
     assert torch.equal(first.parent, second.parent)
 
 
+def test_reference_tree_depth_bias_reallocates_without_changing_raw_probability() -> (
+    None
+):
+    candidate_ids = torch.tensor([[[10, 11], [20, 21]]], dtype=torch.int64)
+    scores = torch.tensor(
+        [[[[0.0, -0.1], [0.0, -0.1]], [[0.0, 0.0], [0.0, 0.0]]]],
+        dtype=torch.float32,
+    )
+    raw = build_dflash_selector_tree_reference(candidate_ids, scores, budget=2)
+    deep = build_dflash_selector_tree_reference(
+        candidate_ids, scores, budget=2, depth_log_bias=1.0
+    )
+
+    assert raw.depth.tolist() == [[1, 1]]
+    assert deep.depth.tolist() == [[1, 2]]
+    assert deep.cumulative_log_probability[0, 0] == pytest.approx(
+        raw.cumulative_log_probability[0, 0]
+    )
+    assert deep.cumulative_log_probability[0, 1] < 0.0
+
+
 @pytest.mark.parametrize("budget", [0, -1])
 def test_reference_tree_rejects_nonpositive_budget(budget: int) -> None:
     candidate_ids, edge_scores = _branching_lattice()
@@ -65,9 +84,20 @@ def test_reference_tree_rejects_nonpositive_budget(budget: int) -> None:
         build_dflash_selector_tree_reference(candidate_ids, edge_scores, budget)
 
 
+def test_reference_tree_rejects_nonfinite_depth_bias() -> None:
+    candidate_ids, edge_scores = _branching_lattice()
+    with pytest.raises(ValueError, match="depth_log_bias must be finite"):
+        build_dflash_selector_tree_reference(
+            candidate_ids, edge_scores, budget=4, depth_log_bias=math.nan
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("budget", [1, 3, 7, 12])
-def test_triton_tree_matches_reference_random_lattice(budget: int) -> None:
+@pytest.mark.parametrize("depth_log_bias", [0.0, -0.375, 0.5])
+def test_triton_tree_matches_reference_random_lattice(
+    budget: int, depth_log_bias: float
+) -> None:
     from sglang.kernels.ops.speculative.dflash_tree import (
         build_dflash_selector_tree_triton,
     )
@@ -78,10 +108,16 @@ def test_triton_tree_matches_reference_random_lattice(budget: int) -> None:
     ).to(torch.int64)
     edge_scores = torch.randn((3, 7, 16, 16), generator=generator)
     expected = build_dflash_selector_tree_reference(
-        candidate_ids, edge_scores, budget=budget
+        candidate_ids,
+        edge_scores,
+        budget=budget,
+        depth_log_bias=depth_log_bias,
     )
     actual = build_dflash_selector_tree_triton(
-        candidate_ids.cuda(), edge_scores.cuda(), budget=budget
+        candidate_ids.cuda(),
+        edge_scores.cuda(),
+        budget=budget,
+        depth_log_bias=depth_log_bias,
     )
 
     for field in (
@@ -130,10 +166,12 @@ def test_widened_tree_sampler_owns_full_graph_output_buffer() -> None:
         max_bs=3,
         device="cpu",
         selector_tree_budget=12,
+        selector_tree_depth_log_bias=-0.375,
     )
 
     assert sampler.out.shape == (36,)
     assert sampler.tree_parent_list.shape == (3, 13)
+    assert sampler.selector_tree_depth_log_bias == -0.375
 
 
 def test_projected_capture_packs_in_order_and_waits_on_finalize() -> None:

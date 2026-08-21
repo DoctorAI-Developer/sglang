@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -236,6 +237,21 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         server_args.speculative_num_draft_tokens = inferred_block_size
 
     selector_tree_budget = getattr(server_args, "dflash_selector_tree_budget", None)
+    selector_tree_depth_log_bias = getattr(
+        server_args, "dflash_selector_tree_depth_log_bias", None
+    )
+    if selector_tree_depth_log_bias is not None:
+        selector_tree_depth_log_bias = float(selector_tree_depth_log_bias)
+        if not math.isfinite(selector_tree_depth_log_bias):
+            raise ValueError(
+                "--dflash-selector-tree-depth-log-bias must be finite, got "
+                f"{selector_tree_depth_log_bias}."
+            )
+        if selector_tree_budget is None:
+            raise ValueError(
+                "--dflash-selector-tree-depth-log-bias requires "
+                "--dflash-selector-tree-budget."
+            )
     if selector_tree_budget is None:
         if server_args.speculative_eagle_topk is None:
             server_args.speculative_eagle_topk = 1
@@ -305,14 +321,19 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
         server_args.speculative_eagle_topk = selector_top_k
         server_args.dflash_selector_tree_budget = selector_tree_budget
+        server_args.dflash_selector_tree_depth_log_bias = (
+            selector_tree_depth_log_bias
+        )
         logger.warning(
             "Experimental DFlash2 selector tree enabled: non_root_budget=%d, "
-            "draft_rows=%d, verify_rows=%d, selector_top_k=%d. "
+            "draft_rows=%d, verify_rows=%d, selector_top_k=%d, "
+            "depth_log_bias=%s. "
             "Greedy CUDA tp=1 only.",
             selector_tree_budget,
             block_size,
             selector_tree_budget + 1,
             selector_top_k,
+            selector_tree_depth_log_bias or 0.0,
         )
 
     if server_args.speculative_draft_window_size is not None:

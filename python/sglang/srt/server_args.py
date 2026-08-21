@@ -2126,6 +2126,14 @@ class ServerArgs:
         "disabled when omitted.",
         NS("spec"),
     ] = None
+    dflash_selector_tree_depth_log_bias: A[
+        Optional[float],
+        "DFLASH2 experimental selector-tree calibration. Add this static log "
+        "reward per node depth while ranking the fixed-budget prefix tree. "
+        "Requires --dflash-selector-tree-budget; omitted means the raw "
+        "cumulative-probability policy.",
+        NS("spec"),
+    ] = None
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
