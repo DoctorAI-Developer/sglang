@@ -76,6 +76,7 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
+    from flashinfer.quantization.packbits import get_quantization_module
 
     from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
@@ -205,6 +206,7 @@ def fast_prefill_plan(
     kv_lens_host: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
+    packed_mask_bytes: Optional[int] = None,
 ) -> None:
     """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
     draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
@@ -253,6 +255,33 @@ def fast_prefill_plan(
         paged_kv_indices,
         non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
     )
+
+    if custom_mask is not None:
+        assert packed_mask_bytes is not None and packed_mask_bytes > 0
+        assert torch.is_tensor(self._custom_mask_buf)
+        assert torch.is_tensor(self._mask_indptr_buf)
+        raw_mask_indptr = self._sglang_raw_mask_indptr_buf
+        raw_mask_indptr[0] = 0
+        raw_mask_indptr[1:] = torch.cumsum(
+            (qo_indptr[1:] - qo_indptr[:-1])
+            * (
+                (paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) * page_size
+                + paged_kv_last_page_len
+            ),
+            dim=0,
+        )
+        self._mask_indptr_buf[0] = 0
+        self._mask_indptr_buf[1:] = torch.cumsum(
+            (raw_mask_indptr[1:] - raw_mask_indptr[:-1] + 7) // 8,
+            dim=0,
+        )
+        get_quantization_module().segment_packbits(
+            custom_mask.contiguous().view(-1),
+            raw_mask_indptr,
+            self._mask_indptr_buf,
+            "little",
+            self._custom_mask_buf[:packed_mask_bytes],
+        )
 
     self._cached_q_data_type = q_data_type
     self._cached_kv_data_type = (
@@ -809,6 +838,21 @@ class FlashInferAttnBackend(AttentionBackend):
             for w in self.draft_extend_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
+        if (
+            in_capture
+            and forward_mode.is_target_verify()
+            and spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+            and self.prefill_backend == "fa2"
+            and self.dispatch_reason is None
+        ):
+            # The DFlash verify layout is host-known at replay. This also
+            # supports selector-tree custom masks: fast_prefill_plan packs the
+            # live mask directly into graph-owned buffers without the public
+            # segment_packbits helper's device-scalar .item() synchronization.
+            for w in self.prefill_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_prefill_plan, w)
+
         # Refill the SWA write-target buffer from the live out_cache_loc before
         # replay (bound onto the metadata at capture below).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -1087,6 +1131,14 @@ class FlashInferAttnBackend(AttentionBackend):
                     **extra,
                 )
             )
+            if use_custom_mask:
+                # FlashInfer's public segment_packbits allocates its output
+                # after reading a device scalar with .item(). The host-fed
+                # replay path packs directly into the graph-owned output and
+                # needs one separate raw-segment indptr scratch buffer.
+                wrappers[-1]._sglang_raw_mask_indptr_buf = torch.empty(
+                    bs + 1, dtype=torch.int32, device="cuda"
+                )
         return wrappers
 
     @staticmethod
@@ -2197,6 +2249,12 @@ class FlashInferIndicesUpdaterPrefill:
                 max_q_len=num_tokens_per_req,
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
+            if use_custom_mask is not None:
+                q_lens_host = qo_indptr_host[1:] - qo_indptr_host[:-1]
+                raw_mask_lens_host = q_lens_host * seq_lens_cpu_i32
+                paged_plan_kwargs["packed_mask_bytes"] = int(
+                    ((raw_mask_lens_host + 7) // 8).sum()
+                )
 
         if window_left >= 0:
             # selects the module with the per-element window mask compiled in
