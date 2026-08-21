@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.dflash_worker_v2 import (
+    _SelectorDraftSampler,
+    _compact_tree_nodes_to_front,
+)
 from sglang.srt.speculative.dflash_tree import (
     build_dflash_selector_tree_reference,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 
 
 def _branching_lattice(device: str = "cpu") -> tuple[torch.Tensor, torch.Tensor]:
@@ -54,7 +63,7 @@ def test_reference_tree_rejects_nonpositive_budget(budget: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("budget", [1, 3, 7])
+@pytest.mark.parametrize("budget", [1, 3, 7, 12])
 def test_triton_tree_matches_reference_random_lattice(budget: int) -> None:
     from sglang.kernels.ops.speculative.dflash_tree import (
         build_dflash_selector_tree_triton,
@@ -87,6 +96,93 @@ def test_triton_tree_matches_reference_random_lattice(budget: int) -> None:
         rtol=2e-6,
         atol=2e-6,
     )
+
+
+def test_widened_tree_separates_draft_and_target_widths() -> None:
+    with get_context().override_server_args(
+        speculative_num_draft_tokens=8,
+        dflash_selector_tree_budget=12,
+    ):
+        target_width = resolve_num_tokens_per_req(
+            phase="target_verify",
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            is_draft_worker=False,
+        )
+        draft_width = resolve_num_tokens_per_req(
+            phase="target_verify",
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            is_draft_worker=True,
+        )
+
+    assert target_width == 13
+    assert draft_width == 8
+
+
+def test_widened_tree_sampler_owns_full_graph_output_buffer() -> None:
+    sampler = _SelectorDraftSampler(
+        draft_model=SimpleNamespace(
+            candidate_selector=SimpleNamespace(top_k=16),
+        ),
+        block_size=8,
+        max_bs=3,
+        device="cpu",
+        selector_tree_budget=12,
+    )
+
+    assert sampler.out.shape == (36,)
+    assert sampler.tree_parent_list.shape == (3, 13)
+
+
+def test_widened_tree_compaction_keeps_native_output_width() -> None:
+    values = torch.arange(13, dtype=torch.int32)
+    accept_index = torch.tensor([[0, 4, 9, 12, -1, -1, -1, -1]])
+    compact = _compact_tree_nodes_to_front(
+        values,
+        accept_index,
+        batch_size=1,
+        verify_width=13,
+    )
+
+    assert compact[:4].tolist() == [0, 4, 9, 12]
+    assert compact.view(1, 13)[:, :8].shape == (1, 8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_prepare_block_separates_draft_and_verify_cache_widths() -> None:
+    from sglang.kernels.ops.speculative.dflash import (
+        _prepare_dflash_draft_block_unchecked,
+    )
+
+    req_to_token = torch.arange(4 * 32, dtype=torch.int64, device="cuda").view(4, 32)
+    bonus = torch.tensor([101, 202], dtype=torch.int64, device="cuda")
+    prefix = torch.tensor([3, 7], dtype=torch.int64, device="cuda")
+    req_indices = torch.tensor([1, 3], dtype=torch.int64, device="cuda")
+    block_ids = torch.empty((2, 8), dtype=torch.int64, device="cuda")
+    positions = torch.empty_like(block_ids)
+    draft_cache = torch.empty_like(block_ids)
+    verify_cache = torch.empty((2, 13), dtype=torch.int64, device="cuda")
+
+    _prepare_dflash_draft_block_unchecked(
+        bonus_tokens=bonus,
+        prefix_lens=prefix,
+        req_pool_indices=req_indices,
+        req_to_token=req_to_token,
+        block_ids_out=block_ids,
+        positions_out=positions,
+        draft_cache_loc_out=draft_cache,
+        verify_cache_loc_out=verify_cache,
+        mask_token_id=999,
+    )
+
+    torch.testing.assert_close(block_ids[:, 0].cpu(), bonus.cpu())
+    assert torch.all(block_ids[:, 1:] == 999)
+    expected_positions = prefix[:, None] + torch.arange(8, device="cuda")
+    torch.testing.assert_close(positions, expected_positions)
+    expected_verify = req_to_token[
+        req_indices[:, None], prefix[:, None] + torch.arange(13, device="cuda")
+    ]
+    torch.testing.assert_close(verify_cache, expected_verify)
+    torch.testing.assert_close(draft_cache, expected_verify[:, :8])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

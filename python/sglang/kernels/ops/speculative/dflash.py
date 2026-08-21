@@ -148,46 +148,57 @@ def _prepare_dflash_draft_block_contig_kernel(
     req_to_token_ptr,
     block_ids_out_ptr,
     positions_out_ptr,
-    cache_loc_out_ptr,
+    draft_cache_loc_out_ptr,
+    verify_cache_loc_out_ptr,
     bonus_tokens_stride,
     prefix_lens_stride,
     req_pool_indices_stride,
     req_to_token_row_stride,
     block_ids_row_stride,
     positions_row_stride,
-    cache_loc_row_stride,
+    draft_cache_loc_row_stride,
+    verify_cache_loc_row_stride,
     req_to_token_width,
-    block_size,
+    draft_block_size,
+    verify_width,
     mask_token_id,
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_SIZE)
-    row_mask = cols < block_size
+    draft_mask = cols < draft_block_size
+    verify_mask = cols < verify_width
 
     prefix_len = tl.load(prefix_lens_ptr + row * prefix_lens_stride)
     req_idx = tl.load(req_pool_indices_ptr + row * req_pool_indices_stride)
     bonus_token = tl.load(bonus_tokens_ptr + row * bonus_tokens_stride)
 
     logical_pos = prefix_len.to(tl.int64) + cols
-    valid = row_mask & (logical_pos < req_to_token_width)
+    valid = verify_mask & (logical_pos < req_to_token_width)
     req_row_ptr = req_to_token_ptr + req_idx * req_to_token_row_stride
     slot_ids = tl.load(req_row_ptr + logical_pos, mask=valid, other=0)
 
     block_ids = tl.full((BLOCK_SIZE,), mask_token_id, tl.int64)
     block_ids = tl.where(cols == 0, bonus_token.to(tl.int64), block_ids)
     tl.store(
-        block_ids_out_ptr + row * block_ids_row_stride + cols, block_ids, mask=row_mask
+        block_ids_out_ptr + row * block_ids_row_stride + cols,
+        block_ids,
+        mask=draft_mask,
     )
     tl.store(
         positions_out_ptr + row * positions_row_stride + cols,
         logical_pos,
-        mask=row_mask,
+        mask=draft_mask,
     )
     tl.store(
-        cache_loc_out_ptr + row * cache_loc_row_stride + cols,
+        draft_cache_loc_out_ptr + row * draft_cache_loc_row_stride + cols,
         slot_ids.to(tl.int64),
-        mask=row_mask,
+        mask=draft_mask,
+    )
+    tl.store(
+        verify_cache_loc_out_ptr + row * verify_cache_loc_row_stride + cols,
+        slot_ids.to(tl.int64),
+        mask=verify_mask,
     )
 
 
@@ -198,7 +209,8 @@ def _prepare_dflash_draft_block_unchecked(
     req_to_token: torch.Tensor,
     block_ids_out: torch.Tensor,
     positions_out: torch.Tensor,
-    cache_loc_out: torch.Tensor,
+    draft_cache_loc_out: torch.Tensor,
+    verify_cache_loc_out: torch.Tensor,
     mask_token_id: int,
 ) -> None:
     batch_size = int(bonus_tokens.numel())
@@ -215,13 +227,29 @@ def _prepare_dflash_draft_block_unchecked(
         raise ValueError(
             "DFLASH Triton prepare_block requires contiguous positions_out."
         )
-    if not _is_row_major_contiguous_2d(cache_loc_out):
+    if not _is_row_major_contiguous_2d(draft_cache_loc_out):
         raise ValueError(
-            "DFLASH Triton prepare_block requires contiguous cache_loc_out."
+            "DFLASH Triton prepare_block requires contiguous draft_cache_loc_out."
+        )
+    if not _is_row_major_contiguous_2d(verify_cache_loc_out):
+        raise ValueError(
+            "DFLASH Triton prepare_block requires contiguous verify_cache_loc_out."
         )
 
-    block_size = int(block_ids_out.shape[1])
-    block = triton.next_power_of_2(block_size)
+    draft_block_size = int(block_ids_out.shape[1])
+    verify_width = int(verify_cache_loc_out.shape[1])
+    if int(draft_cache_loc_out.shape[1]) != draft_block_size:
+        raise ValueError(
+            "DFLASH Triton prepare_block requires draft cache width to match "
+            f"the draft block: draft_cache={int(draft_cache_loc_out.shape[1])}, "
+            f"draft_block={draft_block_size}."
+        )
+    if verify_width < draft_block_size:
+        raise ValueError(
+            "DFLASH Triton prepare_block requires verify width >= draft block: "
+            f"verify_width={verify_width}, draft_block={draft_block_size}."
+        )
+    block = triton.next_power_of_2(verify_width)
     num_warps = _pick_num_warps(block)
     _prepare_dflash_draft_block_contig_kernel[(batch_size,)](
         bonus_tokens,
@@ -230,16 +258,19 @@ def _prepare_dflash_draft_block_unchecked(
         req_to_token,
         block_ids_out,
         positions_out,
-        cache_loc_out,
+        draft_cache_loc_out,
+        verify_cache_loc_out,
         bonus_tokens.stride(0),
         prefix_lens.stride(0),
         req_pool_indices.stride(0),
         req_to_token.stride(0),
         block_ids_out.stride(0),
         positions_out.stride(0),
-        cache_loc_out.stride(0),
+        draft_cache_loc_out.stride(0),
+        verify_cache_loc_out.stride(0),
         int(req_to_token.shape[1]),
-        block_size,
+        draft_block_size,
+        verify_width,
         int(mask_token_id),
         BLOCK_SIZE=block,
         num_warps=num_warps,

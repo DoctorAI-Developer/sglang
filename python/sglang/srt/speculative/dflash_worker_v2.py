@@ -288,7 +288,10 @@ class _SelectorDraftSampler:
         self.block_size = int(block_size)
         self.selector_tree_budget = int(selector_tree_budget)
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
-        self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
+        output_width = max(gamma, self.selector_tree_budget)
+        self.out = torch.empty(
+            (max_bs * output_width,), dtype=torch.int64, device=device
+        )
         if self.selector_tree_budget:
             budget = self.selector_tree_budget
             self.tree_parent_list = torch.empty(
@@ -478,16 +481,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
+        # Keep the checkpoint-native parallel draft width independent from
+        # the number of alternate tree nodes evaluated by the target.
+        self.verify_width = (
+            self.selector_tree_budget + 1
+            if self.selector_tree_budget
+            else self.block_size
+        )
         if self.selector_tree_budget:
             if self.selector is None:
                 raise RuntimeError(
                     "The DFlash selector tree requires a DFlash2 candidate selector."
                 )
-            if self.selector_tree_budget != self.block_size - 1:
+            if self.selector_tree_budget < self.block_size - 1:
                 raise RuntimeError(
-                    "The cost-neutral DFlash selector tree requires "
-                    f"budget=block_size-1, got budget={self.selector_tree_budget}, "
-                    f"block_size={self.block_size}."
+                    "The widened DFlash selector tree requires at least one "
+                    "non-root node per draft depth: "
+                    f"budget={self.selector_tree_budget}, block_size={self.block_size}."
                 )
             if int(self.selector.top_k) != int(server_args.speculative_eagle_topk):
                 raise RuntimeError(
@@ -531,9 +541,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self.selector_tree_budget:
                 logger.warning(
                     "DFLASH2 predecessor-conditioned selector tree active. "
-                    "non_root_budget=%d, verify_rows=%d, top_k=%d.",
+                    "non_root_budget=%d, draft_rows=%d, verify_rows=%d, top_k=%d.",
                     self.selector_tree_budget,
                     self.block_size,
+                    self.verify_width,
                     int(self.selector.top_k),
                 )
 
@@ -549,6 +560,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._draft_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
+        )
+        self._target_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, verify_width]
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._selector_path_indices_buf: Optional[torch.Tensor] = None
@@ -977,6 +991,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
         device = self.device
         block_size = int(self.block_size)
+        verify_width = int(self.verify_width)
         self._draft_block_ids_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
         )
@@ -989,6 +1004,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_verify_out_cache_loc_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
+        self._target_verify_out_cache_loc_buf = torch.empty(
+            (new_cap, verify_width), dtype=torch.int64, device=device
+        )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
@@ -997,12 +1015,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if self.selector_tree_budget:
             self._selector_path_indices_buf = torch.empty(
-                (new_cap, block_size, block_size),
+                (new_cap, verify_width, verify_width),
                 dtype=torch.int32,
                 device=device,
             )
             self._selector_node_depth_buf = torch.empty(
-                (new_cap, block_size), dtype=torch.int32, device=device
+                (new_cap, verify_width), dtype=torch.int32, device=device
             )
 
     def __getattr__(self, name):
@@ -2138,18 +2156,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         block_size = int(self.block_size)
+        verify_width = int(self.verify_width)
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
         assert self._draft_block_tokens_buf is not None
         assert self._draft_verify_out_cache_loc_buf is not None
+        assert self._target_verify_out_cache_loc_buf is not None
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
         block_ids = self._draft_block_ids_buf[:bs]
         prefix_lens = batch.seq_lens
         positions_2d = self._draft_block_positions_buf[:bs]
-        verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+        draft_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+        verify_out_cache_loc_2d = self._target_verify_out_cache_loc_buf[:bs]
         if self._use_triton_prepare_block:
             try:
                 _prepare_dflash_draft_block_unchecked(
@@ -2159,7 +2180,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                     block_ids_out=block_ids,
                     positions_out=positions_2d,
-                    cache_loc_out=verify_out_cache_loc_2d,
+                    draft_cache_loc_out=draft_out_cache_loc_2d,
+                    verify_cache_loc_out=verify_out_cache_loc_2d,
                     mask_token_id=int(self._mask_token_id),
                 )
             except Exception as e:
@@ -2175,17 +2197,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._block_pos_offsets,
                     out=positions_2d,
                 )
-                end_offset = prefix_lens + block_size
+                end_offset = prefix_lens + verify_width
                 verify_out_cache_loc = assign_extend_cache_locs_func(
                     req_pool_indices=batch.req_pool_indices,
                     req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                     start_offset=prefix_lens,
                     end_offset=end_offset,
                     batch_size=bs,
-                    draft_token_num=block_size,
+                    draft_token_num=verify_width,
                     device=device,
                 )
-                verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
+                verify_out_cache_loc_2d.copy_(
+                    verify_out_cache_loc.view(bs, verify_width)
+                )
+                draft_out_cache_loc_2d.copy_(
+                    verify_out_cache_loc_2d[:, :block_size]
+                )
         else:
             block_ids.fill_(int(self._mask_token_id))
             block_ids[:, 0].copy_(draft_input.bonus_tokens)
@@ -2194,17 +2221,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._block_pos_offsets,
                 out=positions_2d,
             )
-            end_offset = prefix_lens + block_size
+            end_offset = prefix_lens + verify_width
             verify_out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=batch.req_pool_indices,
                 req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                 start_offset=prefix_lens,
                 end_offset=end_offset,
                 batch_size=bs,
-                draft_token_num=block_size,
+                draft_token_num=verify_width,
                 device=device,
             )
-            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
+            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, verify_width))
+            draft_out_cache_loc_2d.copy_(verify_out_cache_loc_2d[:, :block_size])
 
         noise_embedding = embed_module(block_ids)
         if self._noise_embed_scale != 1.0:
@@ -2212,6 +2240,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
+        draft_out_cache_loc = draft_out_cache_loc_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
@@ -2228,7 +2257,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=batch.req_pool_indices,
                 prefix_lens=prefix_lens,
                 draft_prefix_lens=draft_prefix_lens,
-                verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                verify_out_cache_loc_2d=draft_out_cache_loc_2d,
                 bs=bs,
                 block_size=block_size,
             )
@@ -2258,7 +2287,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=draft_out_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
@@ -2283,9 +2312,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         folded = self._draft_sampler is not None and draft_out.can_run_graph
         if folded:
-            draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
             if self.selector_tree_budget:
                 sampler = self._draft_sampler
                 assert sampler.tree_parent_list is not None
@@ -2294,8 +2320,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 assert sampler.tree_depth is not None
                 assert sampler.tree_candidate_index is not None
                 assert sampler.tree_cumulative is not None
+                tree_tokens = sampler.out[
+                    : bs * int(self.selector_tree_budget)
+                ].view(bs, int(self.selector_tree_budget))
                 self._selector_tree = DFlashSelectorTree(
-                    draft_tokens=draft_next,
+                    draft_tokens=tree_tokens,
                     parent_list=sampler.tree_parent_list[:bs],
                     selected_index=sampler.tree_selected_index[:bs],
                     parent=sampler.tree_parent[:bs],
@@ -2303,11 +2332,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                     candidate_index=sampler.tree_candidate_index[:bs],
                     cumulative_log_probability=sampler.tree_cumulative[:bs],
                 )
+                draft_next = tree_tokens[:, : int(self.block_size) - 1]
             elif self.selector is not None and not _is_all_greedy(batch.sampling_info):
+                draft_next = self._draft_sampler.out[
+                    : bs * (int(self.block_size) - 1)
+                ].view(bs, int(self.block_size) - 1)
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
                     self._draft_sampler.q_out[:bs],
                 )
+            else:
+                draft_next = self._draft_sampler.out[
+                    : bs * (int(self.block_size) - 1)
+                ].view(bs, int(self.block_size) - 1)
         elif self.selector is not None:
             draft_next = self._propose_selector_block(
                 draft_logits_output=draft_logits_output,
@@ -2330,7 +2367,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+        draft_tokens[:, 1:].copy_(draft_next[:, : block_size - 1])
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -2397,7 +2434,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_sum,
                 int(self.selector.top_k),
                 block_size - 1,
-                block_size,
+                verify_width,
                 mask_mode,
                 tree_mask_buf,
                 fill_prefix_mask=fill_mask,
@@ -2408,7 +2445,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
             positions=verify_positions,
-            draft_token_num=int(self.block_size),
+            draft_token_num=verify_width,
             topk=tree_topk,
             tree_depth=tree_depth,
             retrieve_index=retrieve_index,
@@ -2429,8 +2466,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
+            # Target planning reserves the full tree, which may be wider than
+            # the checkpoint-native draft block.
+            verify_host_seq_lens = seq_lens_cpu_backup + verify_width
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:
@@ -2466,7 +2504,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=int(self.block_size),
+                draft_token_num=verify_width,
             )
         self._audit_full_target_top1(logits_output.next_token_logits)
 
@@ -2474,7 +2512,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         if grammar_mask is not None:
             grammar_mask.apply(logits_output.next_token_logits)
 
-        candidates = draft_tokens
+        candidates = (
+            verify_input_ids.view(bs, verify_width)
+            if self.selector_tree_budget
+            else draft_tokens
+        )
         new_seq_lens = None
         target_predict = None
         tree_accept_index = None
@@ -2484,13 +2526,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_predict = _map_reduced_target_top1(
                     logits_output.next_token_logits,
                     self._reduced_target_token_ids,
-                ).view(bs, block_size)
+                ).view(bs, verify_width)
             else:
                 target_predict = torch.argmax(
                     logits_output.next_token_logits, dim=-1
-                ).view(bs, block_size)
+                ).view(bs, verify_width)
             predict = torch.zeros(
-                (bs * block_size,), dtype=torch.int32, device=device
+                (bs * verify_width,), dtype=torch.int32, device=device
             )
             tree_accept_index = torch.full(
                 (bs, block_size), -1, dtype=torch.int32, device=device
@@ -2515,9 +2557,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 predict,
                 tree_accept_index,
                 batch_size=bs,
-                verify_width=block_size,
+                verify_width=verify_width,
             )
-            out_tokens = compact_predict.view(bs, block_size)
+            out_tokens = (
+                compact_predict.view(bs, verify_width)[:, :block_size].contiguous()
+            )
             bonus = out_tokens.gather(
                 1, (commit_lens.to(torch.int64) - 1).unsqueeze(1)
             ).flatten()
@@ -2636,7 +2680,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch,
                 commit_lens,
                 tree_accept_index,
-                block_size,
+                verify_width,
             )
         elif self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
@@ -2669,14 +2713,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                 hidden,
                 tree_accept_index,
                 batch_size=bs,
-                verify_width=block_size,
+                verify_width=verify_width,
             )
-        hidden = hidden.view(bs, int(self.block_size), -1)
+            hidden = (
+                hidden.view(bs, verify_width, -1)[:, :block_size, :]
+                .contiguous()
+                .view(bs * block_size, -1)
+            )
+        hidden = hidden.view(bs, block_size, -1)
 
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
+            cache_loc=draft_out_cache_loc,
+            cache_loc_2d=draft_out_cache_loc_2d,
             # Accepted tree paths have monotonically increasing depth, so after
             # compaction their logical positions equal this original linear row.
             positions=positions,

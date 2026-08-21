@@ -2120,9 +2120,10 @@ class ServerArgs:
     dflash_selector_tree_budget: A[
         Optional[int],
         "DFLASH2 experimental. Build a predecessor-conditioned best-first "
-        "selector tree with this many non-root nodes. The initial qualified "
-        "path requires budget == block_size - 1, preserving the target verify "
-        "row count. Greedy CUDA tp=1 only; disabled when omitted.",
+        "selector tree with this many non-root nodes. Budgets larger than "
+        "block_size - 1 widen only the target verification tree; the draft "
+        "checkpoint retains its native block width. Greedy CUDA tp=1 only; "
+        "disabled when omitted.",
         NS("spec"),
     ] = None
     speculative_dspark_block_size: A[
@@ -9105,7 +9106,8 @@ class ServerArgs:
         if self.speculative_num_draft_tokens is None:
             return None
         if not self.speculative_adaptive:
-            return self.speculative_num_draft_tokens
+            selector_budget = self.dflash_selector_tree_budget or 0
+            return max(self.speculative_num_draft_tokens, selector_budget + 1)
 
         from sglang.srt.speculative.adaptive_spec_params import (
             resolve_candidate_steps_from_config,

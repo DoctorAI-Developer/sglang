@@ -118,6 +118,9 @@ def resolve_num_tokens_per_req(
     if phase == "target_verify":
         if num_draft_tokens is None:
             num_draft_tokens = spec.speculative_num_draft_tokens
+        if spec_algorithm.is_dflash() and not is_draft_worker:
+            selector_budget = getattr(spec, "dflash_selector_tree_budget", None) or 0
+            num_draft_tokens = max(num_draft_tokens, selector_budget + 1)
         return spec_algorithm.get_num_tokens_per_req_for_target_verify(
             num_draft_tokens, is_draft_worker
         )

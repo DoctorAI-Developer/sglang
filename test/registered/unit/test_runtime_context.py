@@ -389,6 +389,9 @@ class _FakeResolvedArgs:
     disable_radix_cache: A[bool, Arg(help="drc"), NS("memory")] = False
     mamba_radix_cache_strategy: A[str, Arg(help="mrcs"), NS("exec.mamba")] = "auto"
     speculative_num_draft_tokens: A[int | None, Arg(help="d"), NS("spec")] = None
+    dflash_selector_tree_budget: A[
+        int | None, Arg(help="dstb"), NS("spec")
+    ] = None
     speculative_adaptive: A[bool, Arg(help="a"), NS("spec")] = False
     speculative_adaptive_config: A[str | None, Arg(help="c"), NS("spec")] = None
     load_format: A[str, Arg(help="lf"), NS("model")] = "auto"
@@ -1138,6 +1141,21 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                             ServerArgs.get_attention_backends(args),
                             attention_backends(),
                         )
+
+
+class TestDFlashSelectorTreeBound(_IsolatedServerArgs):
+    def test_widened_tree_controls_runtime_and_server_reservation(self):
+        args = _FakeResolvedArgs(
+            speculative_num_draft_tokens=8,
+            dflash_selector_tree_budget=12,
+        )
+        get_context().set_server_args(args)
+
+        self.assertEqual(max_speculative_num_draft_tokens(), 13)
+        self.assertEqual(
+            ServerArgs.max_speculative_num_draft_tokens.func(args),
+            13,
+        )
 
 
 class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):

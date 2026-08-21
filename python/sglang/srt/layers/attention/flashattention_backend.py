@@ -236,17 +236,15 @@ class FlashAttentionBackend(AttentionBackend):
         self.dflash_exact_tree_metadata = {}
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
-        if (
-            self.speculative_num_draft_tokens is not None
-            and model_runner.is_draft_worker
-        ):
-            # Static verify width; NOTE: overwrites the config-named attr in place.
+        if self.speculative_num_draft_tokens is not None:
+            # Static phase width; the target may verify a wider DFlash selector
+            # tree while the draft runner retains its checkpoint-native block.
             self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
                 phase="target_verify",
                 spec_algorithm=SpeculativeAlgorithm.from_string(
                     get_spec().speculative_algorithm
                 ),
-                is_draft_worker=True,
+                is_draft_worker=model_runner.is_draft_worker,
                 num_draft_tokens=int(self.speculative_num_draft_tokens),
             )
         self.speculative_step_id = speculative_step_id

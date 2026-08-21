@@ -1502,7 +1502,8 @@ def max_speculative_num_draft_tokens() -> int | None:
     if spec.speculative_num_draft_tokens is None:
         return None
     if not spec.speculative_adaptive:
-        return spec.speculative_num_draft_tokens
+        selector_budget = getattr(spec, "dflash_selector_tree_budget", None) or 0
+        return max(spec.speculative_num_draft_tokens, selector_budget + 1)
     # The adaptive branch parses a JSON config, and this is called per decode
     # batch (`spec_prepare_for_decode`), so memoize on the inputs -- keyed, not
     # cached once, so a post-publish override still recomputes.

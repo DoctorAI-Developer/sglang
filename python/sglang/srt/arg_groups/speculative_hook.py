@@ -254,11 +254,11 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "--dflash-selector-tree-budget must be positive, got "
                 f"{selector_tree_budget}."
             )
-        if selector_tree_budget != block_size - 1:
+        if selector_tree_budget < block_size - 1:
             raise ValueError(
-                "The initial DFlash2 selector-tree path preserves the target "
-                "verification row count and therefore requires "
-                "--dflash-selector-tree-budget == block_size - 1. "
+                "The DFlash2 selector-tree path requires at least one "
+                "non-root node per draft depth, so "
+                "--dflash-selector-tree-budget must be >= block_size - 1. "
                 f"Got budget={selector_tree_budget}, block_size={block_size}."
             )
         if not server_args.device.startswith("cuda"):
@@ -287,6 +287,13 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "--dflash-selector-tree-budget requires a DFlash2 checkpoint "
                 "with selector_top_k > 1."
             )
+        max_selector_nodes = (block_size - 1) * selector_top_k
+        if selector_tree_budget > max_selector_nodes:
+            raise ValueError(
+                "--dflash-selector-tree-budget exceeds the bounded selector "
+                f"lattice: budget={selector_tree_budget}, max={max_selector_nodes}, "
+                f"depth={block_size - 1}, top_k={selector_top_k}."
+            )
         if (
             server_args.speculative_eagle_topk is not None
             and int(server_args.speculative_eagle_topk) != selector_top_k
@@ -300,9 +307,11 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         server_args.dflash_selector_tree_budget = selector_tree_budget
         logger.warning(
             "Experimental DFlash2 selector tree enabled: non_root_budget=%d, "
-            "verify_rows=%d, selector_top_k=%d. Greedy CUDA tp=1 only.",
+            "draft_rows=%d, verify_rows=%d, selector_top_k=%d. "
+            "Greedy CUDA tp=1 only.",
             selector_tree_budget,
             block_size,
+            selector_tree_budget + 1,
             selector_top_k,
         )
 
