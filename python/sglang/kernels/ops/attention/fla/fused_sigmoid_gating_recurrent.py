@@ -74,6 +74,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
     """
+    # PDL overlaps this kernel's launch/prologue with the causal-convolution
+    # producer. The fence remains before every producer-dependent load, so
+    # this changes scheduling only. Releasing our own dependents here also
+    # lets the next consumer prepare while this recurrent update executes.
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -147,14 +155,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
         cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
-
-    # Let the dependent launch execute producer-independent index/pointer work
-    # before it fences on causal-convolution output. Every load from q/k/v/a/b
-    # remains below the wait. Releasing our own dependents immediately after
-    # the fence preserves the downstream PDL chain.
-    if USE_GDC:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
 
     step_idx = 0
     for _ in range(0, T):
