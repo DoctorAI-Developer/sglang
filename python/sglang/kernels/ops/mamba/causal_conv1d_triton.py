@@ -810,7 +810,7 @@ def _causal_conv1d_update_kernel(
         acc = acc_preload
 
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
-            # set the parent index of the next token in the eagle tree
+            # Set the parent index of the next token in the EAGLE tree.
             # next token's parent is the current token
             retrieve_next_token_idx = tl.sum(
                 tl.where(idx_tokens == idx_token, retrieve_next_tokens, 0)
@@ -834,80 +834,111 @@ def _causal_conv1d_update_kernel(
                     parent_idx_token,
                     parent_idx_tokens,
                 )
-            # tl.device_print("am", parent_idx_tokens)
 
-            _idx_token = idx_token
-            x_ptrs_1d = x_base_1d + _idx_token * stride_x_token  # [BLOCK_N]
-            matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            # convolution operation: itself * wcol[-1] + parent * wcol[-2] + grand-parent * wcol[-3] + ...
-            for j in tl.static_range(KERNEL_WIDTH):
-                if KERNEL_WIDTH == 2:
-                    if j == 0:
-                        matrix_w = w_col1
-                    else:
-                        matrix_w = w_col0
-                elif KERNEL_WIDTH == 3:
-                    if j == 0:
-                        matrix_w = w_col2
-                    elif j == 1:
-                        matrix_w = w_col1
-                    else:
-                        matrix_w = w_col0
-                elif KERNEL_WIDTH == 4:
-                    if j == 0:
-                        matrix_w = w_col3
-                    elif j == 1:
-                        matrix_w = w_col2
-                    elif j == 2:
-                        matrix_w = w_col1
-                    else:
-                        matrix_w = w_col0
+            # Gather the current token's causal lineage first, then accumulate
+            # taps oldest-to-newest.  The ordinary linear path below uses that
+            # exact operation order (w0/history-oldest ... wN/current).  The
+            # former tree loop accumulated the same products in reverse order,
+            # which is algebraically equivalent but introduces persistent
+            # rounding drift in hybrid GDN models after every speculative
+            # commit.  Keeping the order identical makes the root bit-exact and
+            # gives every branch the same arithmetic as sequential replay.
+            lineage_idx = idx_token
+            matrix_current = tl.load(
+                x_base_1d + lineage_idx * stride_x_token, mask=mask_x_1d
+            )
 
-                if SAVE_INTERMEDIATE:
-                    # Save the window state after consuming this token
-                    # Layout: [seq(cache line), step, dim, win(K-1)]
-                    base_ptr = (
-                        intermediate_conv_window_ptr
-                        + intermediate_state_batch_coord * stride_inter_seq
-                        + idx_token * stride_inter_step
-                        + idx_feats * stride_inter_dim
+            if KERNEL_WIDTH >= 2:
+                if lineage_idx > 0:
+                    lineage_idx = tl.sum(
+                        tl.where(idx_tokens == lineage_idx, parent_idx_tokens, 0)
                     )
-
-                    # store itself in KERNEL_WIDTH-2 slot, parent in KERNEL_WIDTH-3 slot, grand-parent in KERNEL_WIDTH-4 slot, ...
-                    if KERNEL_WIDTH - j - 2 >= 0:
-                        tl.store(
-                            base_ptr + (KERNEL_WIDTH - j - 2) * stride_inter_win,
-                            matrix_x,
-                            mask=mask_w,
-                        )
-
-                acc += matrix_x * matrix_w
-
-                # move to parent for next iteration
-                if _idx_token > 0:
-                    _idx_token = tl.sum(
-                        tl.where(idx_tokens == _idx_token, parent_idx_tokens, 0)
+                    matrix_prev1 = tl.load(
+                        x_base_1d + lineage_idx * stride_x_token, mask=mask_x_1d
                     )
-                    x_ptrs_1d = x_base_1d + _idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
                 else:
-                    # no parent within the current chunk, load from prev conv state: col[-1] (idx 0's parent), col[-2] (idx 0's grand parent), ...
                     if KERNEL_WIDTH == 2:
-                        if _idx_token == 0:
-                            matrix_x = col0
+                        matrix_prev1 = col0
                     elif KERNEL_WIDTH == 3:
-                        if _idx_token == 0:
-                            matrix_x = col1
-                        else:
-                            matrix_x = col0
+                        matrix_prev1 = col1
                     elif KERNEL_WIDTH == 4:
-                        if _idx_token == 0:
-                            matrix_x = col2
-                        elif _idx_token == -1:
-                            matrix_x = col1
+                        matrix_prev1 = col2
+                    lineage_idx = lineage_idx - 1
+
+            if KERNEL_WIDTH >= 3:
+                if lineage_idx > 0:
+                    lineage_idx = tl.sum(
+                        tl.where(idx_tokens == lineage_idx, parent_idx_tokens, 0)
+                    )
+                    matrix_prev2 = tl.load(
+                        x_base_1d + lineage_idx * stride_x_token, mask=mask_x_1d
+                    )
+                else:
+                    if KERNEL_WIDTH == 3:
+                        if lineage_idx == 0:
+                            matrix_prev2 = col1
                         else:
-                            matrix_x = col0
-                    _idx_token = _idx_token - 1
+                            matrix_prev2 = col0
+                    elif KERNEL_WIDTH == 4:
+                        if lineage_idx == 0:
+                            matrix_prev2 = col2
+                        else:
+                            matrix_prev2 = col1
+                    lineage_idx = lineage_idx - 1
+
+            if KERNEL_WIDTH >= 4:
+                if lineage_idx > 0:
+                    lineage_idx = tl.sum(
+                        tl.where(idx_tokens == lineage_idx, parent_idx_tokens, 0)
+                    )
+                    matrix_prev3 = tl.load(
+                        x_base_1d + lineage_idx * stride_x_token, mask=mask_x_1d
+                    )
+                else:
+                    matrix_prev3 = tl.where(
+                        lineage_idx == 0,
+                        col2,
+                        tl.where(lineage_idx == -1, col1, col0),
+                    )
+
+            if SAVE_INTERMEDIATE:
+                # Layout after this node: oldest retained token to newest.
+                base_ptr = (
+                    intermediate_conv_window_ptr
+                    + intermediate_state_batch_coord * stride_inter_seq
+                    + idx_token * stride_inter_step
+                    + idx_feats * stride_inter_dim
+                )
+                if KERNEL_WIDTH == 2:
+                    tl.store(base_ptr, matrix_current, mask=mask_w)
+                elif KERNEL_WIDTH == 3:
+                    tl.store(base_ptr, matrix_prev1, mask=mask_w)
+                    tl.store(
+                        base_ptr + stride_inter_win, matrix_current, mask=mask_w
+                    )
+                elif KERNEL_WIDTH == 4:
+                    tl.store(base_ptr, matrix_prev2, mask=mask_w)
+                    tl.store(
+                        base_ptr + stride_inter_win, matrix_prev1, mask=mask_w
+                    )
+                    tl.store(
+                        base_ptr + 2 * stride_inter_win,
+                        matrix_current,
+                        mask=mask_w,
+                    )
+
+            if KERNEL_WIDTH == 2:
+                acc += matrix_prev1 * w_col0
+                acc += matrix_current * w_col1
+            elif KERNEL_WIDTH == 3:
+                acc += matrix_prev2 * w_col0
+                acc += matrix_prev1 * w_col1
+                acc += matrix_current * w_col2
+            elif KERNEL_WIDTH == 4:
+                acc += matrix_prev3 * w_col0
+                acc += matrix_prev2 * w_col1
+                acc += matrix_prev1 * w_col2
+                acc += matrix_current * w_col3
         else:
             matrix_w = w_col0
             matrix_x = col0

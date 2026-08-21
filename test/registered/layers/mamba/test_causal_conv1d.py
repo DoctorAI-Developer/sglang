@@ -183,6 +183,83 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
+def test_causal_conv1d_tree_matches_bit_exact_sequential_paths():
+    """Tree verify must preserve the linear kernel's accumulation order.
+
+    Hybrid models commit a selected tree node's convolution window and reuse it
+    on the next decode iteration.  A merely close tree result can therefore
+    accumulate into an output-token change.  Compare every node against an
+    independent linear replay of its root-to-node path, including the saved
+    window used by the commit hook.
+    """
+
+    device = get_device()
+    torch.manual_seed(20260821)
+    batch, dim, seqlen, width = 1, 256, 8, 4
+    dtype = torch.bfloat16
+    x = torch.randn(batch, dim, seqlen, device=device, dtype=dtype)
+    initial_state = torch.randn(
+        batch, dim, width - 1, device=device, dtype=dtype
+    )
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype)
+    cache_indices = torch.tensor([0], dtype=torch.int32, device=device)
+    intermediate_indices = torch.tensor([0], dtype=torch.int32, device=device)
+
+    # DFS-compatible tree links for parents [root, 0, 1, 2, 1, 0, 5, 6].
+    retrieve_next = torch.tensor(
+        [[1, 2, 3, -1, -1, 6, 7, -1]], dtype=torch.int32, device=device
+    )
+    retrieve_sibling = torch.tensor(
+        [[-1, 5, 4, -1, -1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    retrieve_parent = torch.empty_like(retrieve_next)
+    tree_windows = torch.empty(
+        batch, seqlen, dim, width - 1, device=device, dtype=dtype
+    )
+    tree_out = causal_conv1d_update(
+        x,
+        initial_state.clone(),
+        weight,
+        bias,
+        activation="silu",
+        conv_state_indices=cache_indices,
+        intermediate_conv_window=tree_windows,
+        intermediate_state_indices=intermediate_indices,
+        retrieve_next_token=retrieve_next,
+        retrieve_next_sibling=retrieve_sibling,
+        retrieve_parent_token=retrieve_parent,
+    )
+
+    expected_parent = [0, 0, 1, 2, 1, 0, 5, 6]
+    assert retrieve_parent.cpu().tolist() == [expected_parent]
+    for node in range(seqlen):
+        path = []
+        cursor = node
+        while cursor:
+            path.append(cursor)
+            cursor = expected_parent[cursor]
+        path.append(0)
+        path.reverse()
+        linear_windows = torch.empty(
+            batch, len(path), dim, width - 1, device=device, dtype=dtype
+        )
+        linear_out = causal_conv1d_update(
+            x[:, :, path],
+            initial_state.clone(),
+            weight,
+            bias,
+            activation="silu",
+            conv_state_indices=cache_indices,
+            intermediate_conv_window=linear_windows,
+            intermediate_state_indices=intermediate_indices,
+        )
+        assert torch.equal(tree_out[:, :, node], linear_out[:, :, -1])
+        assert torch.equal(tree_windows[:, node], linear_windows[:, -1])
+
+
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
