@@ -1463,15 +1463,29 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
+        # Qwen3.8 DFlash may project the captured target features on a child
+        # stream. Logits processing needs only to carry that tensor into its
+        # output; the target vocabulary head consumes ``hidden_states`` instead.
+        # Delay the join until after logits so projection overlaps both the tail
+        # of the target backbone and the head, but still joins before graph end.
+        deferred_aux_hidden_states = None
+        get_unwaited = getattr(aux_hidden_states, "unwaited_tensor", None)
+        if callable(get_unwaited):
+            deferred_aux_hidden_states = aux_hidden_states
+            aux_hidden_states = get_unwaited()
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
-                return self.logits_processor(
+                logits_output = self.logits_processor(
                     input_ids,
                     hidden_states,
                     self.lm_head,
                     forward_batch,
                     aux_hidden_states,
                 )
+                if deferred_aux_hidden_states is not None:
+                    deferred_aux_hidden_states.wait()
+                return logits_output
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:

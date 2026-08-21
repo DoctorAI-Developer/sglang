@@ -16,7 +16,7 @@
 
 import logging
 from functools import lru_cache
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Callable, Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -134,6 +134,72 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
+
+
+class _DFlashProjectedCapture:
+    """Pack target captures and launch one exact draft projection at completion.
+
+    The callback may enqueue the projection on a side stream. The owning causal
+    LM can pass ``unwaited_tensor`` through logits processing and join with
+    ``wait`` only after the target vocabulary head, while still ending the CUDA
+    graph with all child-stream work joined.
+    """
+
+    copies_on_append = True
+
+    def __init__(
+        self,
+        num_captures: int,
+        projector: Callable[[torch.Tensor], torch.Tensor],
+        waiter: Callable[[], None],
+    ) -> None:
+        self._num_captures = int(num_captures)
+        self._projector = projector
+        self._waiter = waiter
+        self._buffer: Optional[torch.Tensor] = None
+        self._feature_size: Optional[int] = None
+        self._projected: Optional[torch.Tensor] = None
+        self._idx = 0
+
+    def append(self, hidden: torch.Tensor) -> None:
+        feature_size = int(hidden.shape[-1])
+        if self._buffer is None:
+            self._feature_size = feature_size
+            self._buffer = hidden.new_empty(
+                (*hidden.shape[:-1], feature_size * self._num_captures)
+            )
+        if feature_size != self._feature_size or self._idx >= self._num_captures:
+            raise RuntimeError(
+                "Invalid DFlash projected-capture geometry: "
+                f"feature={feature_size}, expected={self._feature_size}, "
+                f"capture={self._idx}, total={self._num_captures}."
+            )
+        start = self._idx * feature_size
+        self._buffer[..., start : start + feature_size].copy_(hidden)
+        self._idx += 1
+        if self._idx == self._num_captures:
+            self._projected = self._projector(self._buffer)
+
+    def __len__(self) -> int:
+        return self._idx
+
+    def unwaited_tensor(self) -> torch.Tensor:
+        if self._projected is None or self._idx != self._num_captures:
+            raise RuntimeError(
+                "Incomplete DFlash projected capture: "
+                f"captured={self._idx}, expected={self._num_captures}."
+            )
+        return self._projected
+
+    def wait(self) -> None:
+        self._waiter()
+
+    def finalize(self) -> torch.Tensor:
+        projected = self.unwaited_tensor()
+        self.wait()
+        return projected
+
+
 _is_amx_available = cpu_has_amx_support()
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
@@ -1393,6 +1459,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
 
         self.layers_to_capture = []
+        self._dflash_capture_projector: Optional[
+            Callable[[torch.Tensor], torch.Tensor]
+        ] = None
+        self._dflash_capture_waiter: Optional[Callable[[], None]] = None
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1401,6 +1471,18 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.layers_to_capture = layers_to_capture
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
+    def set_dflash_projection_overlap(
+        self,
+        projector: Callable[[torch.Tensor], torch.Tensor],
+        waiter: Callable[[], None],
+    ) -> None:
+        # DFlashWorkerV2 is constructed before the model runner calls
+        # ``set_dflash_layers_to_capture``. Installing these callbacks early is
+        # intentional; the capture layer list is populated before CUDA graph
+        # capture or any model forward.
+        self._dflash_capture_projector = projector
+        self._dflash_capture_waiter = waiter
 
     def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]):
         # Alias of the DFlash path: same per-layer capture convention on this
@@ -1437,7 +1519,24 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        # Breakable prefill graphs end and restart capture segments inside the
+        # hybrid GDN stack. Side-stream work cannot cross those boundaries, so
+        # overlap only the monolithic hot-path TARGET_VERIFY graph. Prefill keeps
+        # returning the original packed K*H captures and is projected by the
+        # worker after the target forward, exactly as before.
+        use_dflash_projection_overlap = (
+            self._dflash_capture_projector is not None
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        if use_dflash_projection_overlap:
+            assert self._dflash_capture_waiter is not None
+            aux_hidden_states = _DFlashProjectedCapture(
+                len(self.layers_to_capture),
+                self._dflash_capture_projector,
+                self._dflash_capture_waiter,
+            )
+        else:
+            aux_hidden_states = []
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
@@ -1492,6 +1591,9 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         if len(aux_hidden_states) == 0:
             return hidden_states
+
+        if isinstance(aux_hidden_states, _DFlashProjectedCapture):
+            return hidden_states, aux_hidden_states
 
         return hidden_states, aux_hidden_states
 

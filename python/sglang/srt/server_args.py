@@ -2215,6 +2215,14 @@ class ServerArgs:
         "from --speculative-token-map when no target-only map is supplied.",
         NS("spec"),
     ] = False
+    enable_dflash_target_projection_overlap: A[
+        bool,
+        "DFLASH research only. Project the packed target captures on a CUDA "
+        "side stream as soon as the final configured capture is available, "
+        "overlapping the remaining target layers and target head. Disabled by "
+        "default.",
+        NS("spec"),
+    ] = False
     speculative_attention_mode: A[
         str,
         Arg(

@@ -324,6 +324,16 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
             )
 
+    if getattr(server_args, "enable_dflash_target_projection_overlap", False):
+        if not server_args.device.startswith("cuda"):
+            raise ValueError(
+                "--enable-dflash-target-projection-overlap requires CUDA."
+            )
+        if int(server_args.tp_size) != 1:
+            raise ValueError(
+                "--enable-dflash-target-projection-overlap currently requires "
+                f"tensor parallel size 1, got tp_size={server_args.tp_size}."
+            )
     if getattr(server_args, "enable_dflash_reduced_target_head", False):
         if (
             getattr(server_args, "dflash_target_token_map", None) is None

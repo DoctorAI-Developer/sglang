@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.models.qwen3_5 import (
+    _DFlashProjectedCapture,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_worker_v2 import (
     _SelectorDraftSampler,
@@ -131,6 +134,28 @@ def test_widened_tree_sampler_owns_full_graph_output_buffer() -> None:
 
     assert sampler.out.shape == (36,)
     assert sampler.tree_parent_list.shape == (3, 13)
+
+
+def test_projected_capture_packs_in_order_and_waits_on_finalize() -> None:
+    calls = []
+
+    def project(packed: torch.Tensor) -> torch.Tensor:
+        calls.append("project")
+        return packed.sum(dim=-1, keepdim=True)
+
+    def wait() -> None:
+        calls.append("wait")
+
+    capture = _DFlashProjectedCapture(3, project, wait)
+    capture.append(torch.tensor([[1.0, 2.0]]))
+    capture.append(torch.tensor([[3.0, 4.0]]))
+    capture.append(torch.tensor([[5.0, 6.0]]))
+
+    assert len(capture) == 3
+    torch.testing.assert_close(capture.unwaited_tensor(), torch.tensor([[21.0]]))
+    assert calls == ["project"]
+    capture.wait()
+    assert calls == ["project", "wait"]
 
 
 def test_widened_tree_compaction_keeps_native_output_width() -> None:

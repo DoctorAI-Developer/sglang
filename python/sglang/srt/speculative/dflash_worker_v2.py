@@ -440,6 +440,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._audit_target_top1 = bool(
             getattr(server_args, "enable_dflash_target_top1_audit", False)
         )
+        self._use_target_projection_overlap = bool(
+            getattr(server_args, "enable_dflash_target_projection_overlap", False)
+        )
+        self._target_projection_stream: Optional[torch.cuda.Stream] = None
+        self._target_projection_start: Optional[torch.cuda.Event] = None
+        self._target_projection_done: Optional[torch.cuda.Event] = None
         self._target_top1_selected_mask: Optional[torch.Tensor] = None
         self._target_top1_missing_seen: set[int] = set()
 
@@ -586,6 +592,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+        if self._use_target_projection_overlap:
+            self._init_target_projection_overlap(target_model)
 
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
@@ -601,6 +609,48 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+    def _init_target_projection_overlap(self, target_model) -> None:
+        target_backbone = getattr(target_model, "model", None)
+        install = getattr(target_backbone, "set_dflash_projection_overlap", None)
+        if install is None:
+            raise RuntimeError(
+                "--enable-dflash-target-projection-overlap is implemented only "
+                "for the Qwen3.8/Qwen3.5 hybrid target backbone."
+            )
+        self._target_projection_stream = torch.cuda.Stream(device=self.device)
+        self._target_projection_start = torch.cuda.Event()
+        self._target_projection_done = torch.cuda.Event()
+        install(
+            self._project_captured_target_hidden,
+            self._wait_captured_target_projection,
+        )
+        if self.ps.tp_rank == 0:
+            logger.warning(
+                "DFLASH target-capture projection overlap enabled. "
+                "The projector runs on a CUDA side stream and joins after the "
+                "target head; target verification remains authoritative.",
+            )
+
+    def _project_captured_target_hidden(
+        self, packed_hidden: torch.Tensor
+    ) -> torch.Tensor:
+        assert self._target_projection_stream is not None
+        assert self._target_projection_start is not None
+        assert self._target_projection_done is not None
+        current_stream = torch.cuda.current_stream(device=self.device)
+        self._target_projection_start.record(current_stream)
+        with torch.cuda.stream(self._target_projection_stream):
+            self._target_projection_stream.wait_event(self._target_projection_start)
+            projected = self.draft_model.project_target_hidden(packed_hidden)
+            self._target_projection_done.record(self._target_projection_stream)
+        return projected
+
+    def _wait_captured_target_projection(self) -> None:
+        assert self._target_projection_done is not None
+        torch.cuda.current_stream(device=self.device).wait_event(
+            self._target_projection_done
+        )
 
     def _install_reduced_target_head(self, target_model) -> None:
         lm_head = getattr(target_model, "lm_head", None)
@@ -1727,7 +1777,25 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens = commit_lens.to(torch.int32)
 
         with torch.inference_mode():
-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            if self._use_target_projection_overlap:
+                projected_width = int(self.draft_model.config.hidden_size)
+                packed_width = int(self.draft_model.fc.in_features)
+                actual_width = int(target_hidden.shape[-1])
+                if actual_width == projected_width:
+                    ctx_hidden = target_hidden
+                elif actual_width == packed_width:
+                    # Breakable prefill graphs deliberately stay on the original
+                    # post-forward projection path; only TARGET_VERIFY returns an
+                    # already projected tensor from the side stream.
+                    ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+                else:
+                    raise ValueError(
+                        "DFLASH overlapped target projection width mismatch: "
+                        f"expected={projected_width} (projected) or "
+                        f"{packed_width} (packed), got={actual_width}."
+                    )
+            else:
+                ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 
             if cache_loc_2d is not None:
                 bs = int(commit_lens.shape[0])
