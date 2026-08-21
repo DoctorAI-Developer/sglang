@@ -14,6 +14,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
+    import sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent as fused_gdn_module
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_update,
@@ -232,6 +233,28 @@ def test_mtp_single_step_decode(N: int):
         f"fail_rate={state_fail_rate:.2f}%"
     )
     assert state_fail_rate < 0.01, f"State mismatch: fail_rate={state_fail_rate:.2f}%"
+
+
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
+def test_pdl_is_bit_exact_at_qwen_verify_shape(monkeypatch):
+    """PDL changes scheduling, not the B12 target-verification values."""
+    n, t = 1, 13
+    h, hv, k_dim, v_dim = 16, 32, 128, 128
+    a_log, dt_bias, a, b, q, k, v, state, indices, cu_seqlens = _make_tensors(
+        n, t, h, hv, k_dim, v_dim
+    )
+
+    monkeypatch.setattr(fused_gdn_module, "is_arch_support_pdl", lambda: False)
+    control = run_fused_mtp(
+        a_log, dt_bias, q, k, v, a, b, state.clone(), indices, cu_seqlens
+    )
+
+    monkeypatch.setattr(fused_gdn_module, "is_arch_support_pdl", lambda: True)
+    candidate = run_fused_mtp(
+        a_log, dt_bias, q, k, v, a, b, state.clone(), indices, cu_seqlens
+    )
+
+    torch.testing.assert_close(candidate, control, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

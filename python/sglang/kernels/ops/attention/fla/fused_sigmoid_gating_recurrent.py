@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
+
 
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
@@ -54,6 +56,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    USE_GDC: tl.constexpr = False,
     # ReplaySSM fused ring-write. Pointers stay None and CACHE_RING False for
     # decode / flag-off -> byte-identical. The gate ring layout follows IS_KDA
     # (see the store below).
@@ -71,6 +74,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
     """
+    # PDL overlaps this kernel's launch/prologue with the causal-convolution
+    # producer. The fence remains before every producer-dependent load, so
+    # this changes scheduling only. Releasing our own dependents here also
+    # lets the next consumer prepare while this recurrent update executes.
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -440,6 +451,11 @@ def fused_sigmoid_gating_delta_rule_update(
         max_cache_len = 0
         stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
 
+    # Hopper and newer support Programmatic Dependent Launch. Both GDN and
+    # KDA use this recurrent kernel; unsupported architectures retain the
+    # exact original launch path.
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -501,6 +517,7 @@ def fused_sigmoid_gating_delta_rule_update(
         CACHE_RING=cache_ring,
         num_warps=num_warps,
         num_stages=num_stages,
+        **pdl_kwargs,
     )
     o = o.squeeze(0)
     return o

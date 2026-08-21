@@ -640,8 +640,13 @@ def _causal_conv1d_update_kernel(
     USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
+    # Release the recurrent consumer immediately after our own PDL fence.
+    # Its fence still protects every read of this kernel's output, while its
+    # producer-independent prologue can overlap this kernel's body. Trigger
+    # before the padded-batch early return so every CTA publishes completion.
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
@@ -1020,9 +1025,6 @@ def _causal_conv1d_update_kernel(
                 parent_idx_tokens,
                 mask=mask_retrieve,
             )
-
-    if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def causal_conv1d_update(
