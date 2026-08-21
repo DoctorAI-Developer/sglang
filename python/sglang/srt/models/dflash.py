@@ -59,6 +59,50 @@ def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tenso
     return torch.topk(scores, k, dim=-1)
 
 
+def _quantize_dflash_selector_weight_fp8(
+    weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize proposal-only rows in Hopper's per-row-group-128 layout."""
+    from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
+
+    return per_token_group_quant_fp8(weight, 128)
+
+
+def _dflash_selector_fp8_matmul(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Run the Hopper small-M proposal projection; target verify never uses it."""
+    from sglang.srt.layers.quantization.fp8_utils import (
+        flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback,
+    )
+
+    return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
+        hidden,
+        weight,
+        [1, 128],
+        weight_scale,
+    )
+
+
+def _dflash_selector_refine_logits(
+    hidden: torch.Tensor,
+    full_weight: torch.Tensor,
+    hot_token_id: torch.Tensor,
+    shortlist_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Score an FP8-retrieved shortlist against the original BF16 rows."""
+    global_ids = hot_token_id[shortlist_ids]
+    candidate_weight = torch.index_select(
+        full_weight, 0, global_ids.reshape(-1)
+    ).view(*global_ids.shape, full_weight.shape[-1])
+    return torch.bmm(
+        candidate_weight,
+        hidden.to(full_weight.dtype).unsqueeze(-1),
+    ).squeeze(-1)
+
+
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
     """Honor explicit causality while preserving legacy layer defaults."""
     text_config = config.get_text_config()
@@ -950,9 +994,16 @@ class DFlash2DraftModel(DFlashDraftModel):
         # an exact row selection from the target head.
         self._selector_hot_token_id: Optional[torch.Tensor] = None
         self._selector_lm_head_weight: Optional[torch.Tensor] = None
+        self._selector_lm_head_weight_scale: Optional[torch.Tensor] = None
+        self._selector_fp8_refine_topk: int = 0
 
     def set_selector_token_map(
-        self, token_ids: torch.Tensor, lm_head: nn.Module
+        self,
+        token_ids: torch.Tensor,
+        lm_head: nn.Module,
+        *,
+        quantize_fp8: bool = False,
+        fp8_refine_topk: int = 0,
     ) -> None:
         """Restrict DFlash2 proposal scoring to a validated target-vocab subset.
 
@@ -981,13 +1032,56 @@ class DFlash2DraftModel(DFlashDraftModel):
                 "DFlash2 selector token map contains an id outside the target "
                 f"vocabulary [0, {org_vocab_size})."
             )
+        fp8_refine_topk = int(fp8_refine_topk)
+        if fp8_refine_topk:
+            if not quantize_fp8:
+                raise ValueError("FP8 proposal refinement requires quantize_fp8=True.")
+            if fp8_refine_topk <= top_k:
+                raise ValueError(
+                    "FP8 proposal refinement width must exceed selector_top_k: "
+                    f"refine_topk={fp8_refine_topk}, selector_top_k={top_k}."
+                )
+            if fp8_refine_topk > int(token_ids.numel()):
+                raise ValueError(
+                    "FP8 proposal refinement width exceeds the token map: "
+                    f"refine_topk={fp8_refine_topk}, "
+                    f"map_size={int(token_ids.numel())}."
+                )
 
         # Ascending original ids retain the dense head's deterministic tie order.
         token_ids = torch.sort(token_ids).values.to(weight.device)
         self._selector_hot_token_id = token_ids.contiguous()
-        self._selector_lm_head_weight = torch.index_select(
+        selected_weight = torch.index_select(
             weight, 0, self._selector_hot_token_id
         ).contiguous()
+        if quantize_fp8:
+            if selected_weight.device.type != "cuda":
+                raise ValueError("The DFlash2 FP8 proposal head requires CUDA.")
+            if int(selected_weight.shape[0]) % 64 != 0:
+                raise ValueError(
+                    "The DFlash2 FP8 proposal vocabulary must be divisible by 64, "
+                    f"got {int(selected_weight.shape[0])}."
+                )
+            if int(selected_weight.shape[1]) % 128 != 0:
+                raise ValueError(
+                    "The DFlash2 FP8 proposal hidden size must be divisible by 128, "
+                    f"got {int(selected_weight.shape[1])}."
+                )
+            (
+                self._selector_lm_head_weight,
+                self._selector_lm_head_weight_scale,
+            ) = _quantize_dflash_selector_weight_fp8(selected_weight)
+            self._selector_lm_head_weight = (
+                self._selector_lm_head_weight.contiguous()
+            )
+            self._selector_lm_head_weight_scale = (
+                self._selector_lm_head_weight_scale.contiguous()
+            )
+            self._selector_fp8_refine_topk = fp8_refine_topk
+        else:
+            self._selector_lm_head_weight = selected_weight
+            self._selector_lm_head_weight_scale = None
+            self._selector_fp8_refine_topk = 0
 
     def _transform_unary_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = logits.float()
@@ -1015,15 +1109,47 @@ class DFlash2DraftModel(DFlashDraftModel):
                 "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head."
             )
         selector_weight = self._selector_lm_head_weight
+        selector_weight_scale = getattr(
+            self, "_selector_lm_head_weight_scale", None
+        )
         hot_token_id = self._selector_hot_token_id
         if selector_weight is None:
             selector_weight = weight
-        hidden = hidden.to(selector_weight.dtype)
         if get_parallel().tp_size == 1:
             if hot_token_id is None:
                 org = int(self.lm_head.org_vocab_size)
                 selector_weight = selector_weight[:org]
-            vals, ids = _radix_topk(torch.matmul(hidden, selector_weight.T), k)
+            if selector_weight_scale is not None:
+                logits = _dflash_selector_fp8_matmul(
+                    hidden.to(torch.bfloat16),
+                    selector_weight,
+                    selector_weight_scale,
+                )
+                refine_topk = int(getattr(self, "_selector_fp8_refine_topk", 0))
+                if refine_topk:
+                    if hot_token_id is None:
+                        raise RuntimeError(
+                            "DFlash2 FP8 proposal refinement requires a token map."
+                        )
+                    _, shortlist_ids = _radix_topk(logits, refine_topk)
+                    # Local ids follow ascending global ids. Sort before the
+                    # exact top-k so BF16 ties retain the dense head's order.
+                    shortlist_ids = torch.sort(shortlist_ids, dim=-1).values
+                    refined_logits = _dflash_selector_refine_logits(
+                        hidden,
+                        weight,
+                        hot_token_id,
+                        shortlist_ids,
+                    )
+                    vals, refined_local_ids = _radix_topk(refined_logits, k)
+                    ids = torch.gather(shortlist_ids, -1, refined_local_ids)
+                else:
+                    vals, ids = _radix_topk(logits, k)
+            else:
+                logits = torch.matmul(
+                    hidden.to(selector_weight.dtype), selector_weight.T
+                )
+                vals, ids = _radix_topk(logits, k)
             if hot_token_id is not None:
                 ids = hot_token_id[ids]
             return ids.long(), self._transform_unary_logits(vals)
@@ -1033,7 +1159,10 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
         shard = self.lm_head.shard_indices
         vals, ids = _radix_topk(
-            torch.matmul(hidden, weight[: int(shard.num_org_elements)].T), k
+            torch.matmul(
+                hidden.to(weight.dtype), weight[: int(shard.num_org_elements)].T
+            ),
+            k,
         )
         global_ids = ids.long() + int(shard.org_vocab_start_index)
         gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)

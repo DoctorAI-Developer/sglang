@@ -135,6 +135,96 @@ def test_selector_token_map_scores_only_selected_rows_and_restores_global_ids(
     torch.testing.assert_close(vals, expected_vals)
 
 
+def test_selector_fp8_proposal_head_restores_global_ids(monkeypatch):
+    """FP8 is proposal-only: its local ranking still has to leave the draft as
+    original Qwen token ids, and the projection must receive BF16 activations."""
+    monkeypatch.setattr(dflash_module, "_flashinfer_top_k", None)
+    hot_token_id = torch.tensor([1, 3, 5])
+    fp8_weight = torch.zeros((3, 2), dtype=torch.uint8)
+    weight_scale = torch.ones((3, 1), dtype=torch.float32)
+    projected = torch.tensor([[0.1, 3.0, 2.0], [4.0, 0.2, 1.0]])
+
+    def fake_fp8_matmul(hidden, weight, scale):
+        assert hidden.dtype == torch.bfloat16
+        assert weight is fp8_weight
+        assert scale is weight_scale
+        return projected
+
+    monkeypatch.setattr(
+        dflash_module, "_dflash_selector_fp8_matmul", fake_fp8_matmul
+    )
+    lm_head = SimpleNamespace(weight=torch.randn(6, 2), org_vocab_size=6)
+    model = SimpleNamespace(
+        lm_head=lm_head,
+        candidate_selector=SimpleNamespace(top_k=2),
+        draft_config=parse_dflash_draft_config(
+            draft_hf_config={
+                "num_hidden_layers": 5,
+                "dflash_config": {"selector_rank": 2, "selector_top_k": 2},
+            }
+        ),
+        _selector_hot_token_id=hot_token_id,
+        _selector_lm_head_weight=fp8_weight,
+        _selector_lm_head_weight_scale=weight_scale,
+    )
+    model._transform_unary_logits = lambda logits: (
+        DFlash2DraftModel._transform_unary_logits(model, logits)
+    )
+
+    with get_parallel().override(tp_size=1):
+        ids, vals = DFlash2DraftModel.compute_candidates(model, torch.randn(2, 2))
+
+    torch.testing.assert_close(ids, torch.tensor([[3, 5], [1, 5]]))
+    torch.testing.assert_close(vals, torch.tensor([[3.0, 2.0], [4.0, 1.0]]))
+
+
+def test_selector_fp8_shortlist_is_bf16_reranked_before_global_id_restore(
+    monkeypatch,
+):
+    monkeypatch.setattr(dflash_module, "_flashinfer_top_k", None)
+    hot_token_id = torch.tensor([1, 3, 4, 5])
+    fp8_weight = torch.zeros((4, 2), dtype=torch.uint8)
+    weight_scale = torch.ones((4, 1), dtype=torch.float32)
+
+    monkeypatch.setattr(
+        dflash_module,
+        "_dflash_selector_fp8_matmul",
+        lambda hidden, weight, scale: torch.tensor([[10.0, 9.0, 8.0, 0.0]]),
+    )
+
+    def fake_refine(hidden, full_weight, token_ids, shortlist_ids):
+        torch.testing.assert_close(token_ids, hot_token_id)
+        torch.testing.assert_close(shortlist_ids, torch.tensor([[0, 1, 2]]))
+        return torch.tensor([[0.1, 4.0, 2.0]])
+
+    monkeypatch.setattr(
+        dflash_module, "_dflash_selector_refine_logits", fake_refine
+    )
+    model = SimpleNamespace(
+        lm_head=SimpleNamespace(weight=torch.randn(6, 2), org_vocab_size=6),
+        candidate_selector=SimpleNamespace(top_k=2),
+        draft_config=parse_dflash_draft_config(
+            draft_hf_config={
+                "num_hidden_layers": 5,
+                "dflash_config": {"selector_rank": 2, "selector_top_k": 2},
+            }
+        ),
+        _selector_hot_token_id=hot_token_id,
+        _selector_lm_head_weight=fp8_weight,
+        _selector_lm_head_weight_scale=weight_scale,
+        _selector_fp8_refine_topk=3,
+    )
+    model._transform_unary_logits = lambda logits: (
+        DFlash2DraftModel._transform_unary_logits(model, logits)
+    )
+
+    with get_parallel().override(tp_size=1):
+        ids, vals = DFlash2DraftModel.compute_candidates(model, torch.randn(1, 2))
+
+    torch.testing.assert_close(ids, torch.tensor([[3, 4]]))
+    torch.testing.assert_close(vals, torch.tensor([[4.0, 2.0]]))
+
+
 @pytest.mark.parametrize(
     ("token_ids", "match"),
     [

@@ -427,6 +427,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._use_reduced_target_head = bool(
             getattr(server_args, "enable_dflash_reduced_target_head", False)
         )
+        self._use_fp8_proposal_head = bool(
+            getattr(server_args, "enable_dflash_fp8_proposal_head", False)
+        )
+        self._fp8_proposal_refine_topk = int(
+            getattr(server_args, "dflash_fp8_proposal_refine_topk", None) or 0
+        )
         self._reduced_target_token_ids: Optional[torch.Tensor] = None
         self._audit_target_top1 = bool(
             getattr(server_args, "enable_dflash_target_top1_audit", False)
@@ -611,6 +617,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             # materialize its independently optimized map before graph capture.
             self.draft_model._selector_hot_token_id = None
             self.draft_model._selector_lm_head_weight = None
+            self.draft_model._selector_lm_head_weight_scale = None
+            self.draft_model._selector_fp8_refine_topk = 0
         if self.ps.tp_rank == 0:
             logger.warning(
                 "DFLASH reduced greedy TARGET_VERIFY head enabled. tokens=%d, "
@@ -788,16 +796,41 @@ class DFlashWorkerV2(BaseSpecWorker):
                         f"parallel size 1, got tp_size={tp_size}."
                     )
                 hot_token_id = load_token_map(token_map_path)
-                if self.draft_model._selector_lm_head_weight is None:
-                    self.draft_model.set_selector_token_map(hot_token_id, lm_head)
+                selector_scale = getattr(
+                    self.draft_model, "_selector_lm_head_weight_scale", None
+                )
+                needs_materialize = (
+                    self.draft_model._selector_lm_head_weight is None
+                    or (self._use_fp8_proposal_head and selector_scale is None)
+                    or (not self._use_fp8_proposal_head and selector_scale is not None)
+                )
+                if needs_materialize:
+                    self.draft_model.set_selector_token_map(
+                        hot_token_id,
+                        lm_head,
+                        quantize_fp8=self._use_fp8_proposal_head,
+                        fp8_refine_topk=self._fp8_proposal_refine_topk,
+                    )
                 reduced_weight = self.draft_model._selector_lm_head_weight
+                reduced_scale = getattr(
+                    self.draft_model, "_selector_lm_head_weight_scale", None
+                )
                 if self.ps.tp_rank == 0:
                     logger.info(
                         "DFLASH selector proposal vocabulary enabled. "
-                        "tokens=%d, copied_head_mib=%.2f, source=%s",
+                        "tokens=%d, head_dtype=%s, copied_head_mib=%.2f, "
+                        "scale_mib=%.2f, refine_topk=%d, source=%s",
                         int(hot_token_id.numel()),
+                        reduced_weight.dtype,
                         float(reduced_weight.numel() * reduced_weight.element_size())
                         / (1024**2),
+                        0.0
+                        if reduced_scale is None
+                        else float(
+                            reduced_scale.numel() * reduced_scale.element_size()
+                        )
+                        / (1024**2),
+                        self._fp8_proposal_refine_topk,
                         token_map_path,
                     )
             if self.ps.tp_rank == 0:

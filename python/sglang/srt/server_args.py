@@ -2178,6 +2178,20 @@ class ServerArgs:
     speculative_token_map: A[
         Optional[str], "The path of the draft model's small vocab table.", NS("spec")
     ] = None
+    enable_dflash_fp8_proposal_head: A[
+        bool,
+        "DFLASH2 research only. Quantize the materialized proposal-only token "
+        "map head to per-row-group FP8 and run it with the Hopper small-M "
+        "FlashInfer-DeepGEMM kernel. Target verification is unchanged.",
+        NS("spec"),
+    ] = False
+    dflash_fp8_proposal_refine_topk: A[
+        Optional[int],
+        "DFLASH2 research only. Retrieve this many proposal candidates with "
+        "FP8, then rerank the shortlist with the original BF16 target head. "
+        "Requires --enable-dflash-fp8-proposal-head.",
+        NS("spec"),
+    ] = None
     dflash_target_token_map: A[
         Optional[str],
         "DFLASH only. Optional target-verification vocabulary table. When "

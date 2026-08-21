@@ -335,6 +335,48 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "logprobs fail closed."
         )
 
+    if getattr(server_args, "enable_dflash_fp8_proposal_head", False):
+        if server_args.speculative_token_map is None:
+            raise ValueError(
+                "--enable-dflash-fp8-proposal-head requires "
+                "--speculative-token-map."
+            )
+        if not server_args.device.startswith("cuda"):
+            raise ValueError(
+                "--enable-dflash-fp8-proposal-head currently requires CUDA."
+            )
+        if int(server_args.tp_size) != 1:
+            raise ValueError(
+                "--enable-dflash-fp8-proposal-head currently requires tensor "
+                f"parallel size 1, got tp_size={server_args.tp_size}."
+            )
+        logger.warning(
+            "DFLASH2 proposal-only FP8 head enabled. Candidate ranking and "
+            "acceptance can change; target verification remains authoritative."
+        )
+
+    fp8_refine_topk = int(
+        getattr(server_args, "dflash_fp8_proposal_refine_topk", None) or 0
+    )
+    if fp8_refine_topk:
+        if not getattr(server_args, "enable_dflash_fp8_proposal_head", False):
+            raise ValueError(
+                "--dflash-fp8-proposal-refine-topk requires "
+                "--enable-dflash-fp8-proposal-head."
+            )
+        selector_top_k = int(server_args.speculative_eagle_topk or 1)
+        if fp8_refine_topk <= selector_top_k:
+            raise ValueError(
+                "--dflash-fp8-proposal-refine-topk must exceed the selector "
+                f"top-k ({selector_top_k}), got {fp8_refine_topk}."
+            )
+        logger.warning(
+            "DFLASH2 FP8 proposal shortlist will be BF16-reranked: "
+            "shortlist_tokens=%d, final_tokens=%d.",
+            fp8_refine_topk,
+            selector_top_k,
+        )
+
     if getattr(server_args, "enable_dflash_target_top1_audit", False):
         if (
             getattr(server_args, "dflash_target_token_map", None) is None
