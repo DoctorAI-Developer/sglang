@@ -13,6 +13,11 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
+from sglang.kernels.ops.speculative.dflash_tree import (
+    DFlashSelectorTree,
+    _build_dflash_selector_tree_triton_unchecked,
+    build_dflash_selector_tree_triton,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
 )
@@ -54,6 +59,11 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
+    verify_tree_greedy_func,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -62,7 +72,9 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    commit_mamba_states_after_verify,
     load_token_map,
+    move_accept_tokens_to_target_kvcache,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
@@ -172,6 +184,30 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     return out_tokens, accept_len.to(torch.int32) + 1
 
 
+def _compact_tree_nodes_to_front(
+    x: torch.Tensor,
+    accept_index: torch.Tensor,
+    *,
+    batch_size: int,
+    verify_width: int,
+) -> torch.Tensor:
+    """Gather each accepted tree path into the block's contiguous front.
+
+    ``accept_index`` contains global node indices and is -1 padded.  Padded
+    gathers land on node zero but remain beyond ``commit_lens`` and are never
+    consumed; unaccepted trailing slots retain their original values so normal
+    speculative overshoot cleanup remains valid.
+    """
+    chain_width = int(accept_index.shape[1])
+    safe = accept_index.to(torch.int64).clamp(min=0).reshape(-1)
+    gathered = x[safe]
+    out = x.clone()
+    out.view(batch_size, verify_width, *x.shape[1:])[:, :chain_width] = gathered.view(
+        batch_size, chain_width, *x.shape[1:]
+    )
+    return out
+
+
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
@@ -243,12 +279,42 @@ class _SelectorDraftSampler:
     greedy_mask selects the argmax per row.
     """
 
-    def __init__(self, *, draft_model, block_size, max_bs, device):
+    def __init__(
+        self, *, draft_model, block_size, max_bs, device, selector_tree_budget=0
+    ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
+        self.selector_tree_budget = int(selector_tree_budget)
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
+        if self.selector_tree_budget:
+            budget = self.selector_tree_budget
+            self.tree_parent_list = torch.empty(
+                (max_bs, budget + 1), dtype=torch.int64, device=device
+            )
+            self.tree_selected_index = torch.empty(
+                (max_bs, budget), dtype=torch.int64, device=device
+            )
+            self.tree_parent = torch.empty(
+                (max_bs, budget), dtype=torch.int32, device=device
+            )
+            self.tree_depth = torch.empty(
+                (max_bs, budget), dtype=torch.int32, device=device
+            )
+            self.tree_candidate_index = torch.empty(
+                (max_bs, budget), dtype=torch.int32, device=device
+            )
+            self.tree_cumulative = torch.empty(
+                (max_bs, budget), dtype=torch.float32, device=device
+            )
+        else:
+            self.tree_parent_list = None
+            self.tree_selected_index = None
+            self.tree_parent = None
+            self.tree_depth = None
+            self.tree_candidate_index = None
+            self.tree_cumulative = None
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
@@ -264,6 +330,9 @@ class _SelectorDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
         graph replay that consumes them."""
+        if self.selector_tree_budget:
+            # The selector tree is deliberately greedy-only and does not draw.
+            return
         if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
@@ -284,6 +353,28 @@ class _SelectorDraftSampler:
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
+        if self.selector_tree_budget:
+            assert self.tree_parent_list is not None
+            assert self.tree_selected_index is not None
+            assert self.tree_parent is not None
+            assert self.tree_depth is not None
+            assert self.tree_candidate_index is not None
+            assert self.tree_cumulative is not None
+            tree_tokens = self.out[: bs * self.selector_tree_budget].view(
+                bs, self.selector_tree_budget
+            )
+            _build_dflash_selector_tree_triton_unchecked(
+                candidate_ids=candidate_ids,
+                edge_scores=scores,
+                draft_tokens_out=tree_tokens,
+                parent_list_out=self.tree_parent_list[:bs],
+                selected_index_out=self.tree_selected_index[:bs],
+                parent_out=self.tree_parent[:bs],
+                depth_out=self.tree_depth[:bs],
+                candidate_index_out=self.tree_candidate_index[:bs],
+                cumulative_out=self.tree_cumulative[:bs],
+            )
+            return
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
@@ -355,6 +446,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
+        self.selector_tree_budget = int(
+            getattr(server_args, "dflash_selector_tree_budget", None) or 0
+        )
+        self._selector_tree: Optional[DFlashSelectorTree] = None
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -376,6 +471,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
+        if self.selector_tree_budget:
+            if self.selector is None:
+                raise RuntimeError(
+                    "The DFlash selector tree requires a DFlash2 candidate selector."
+                )
+            if self.selector_tree_budget != self.block_size - 1:
+                raise RuntimeError(
+                    "The cost-neutral DFlash selector tree requires "
+                    f"budget=block_size-1, got budget={self.selector_tree_budget}, "
+                    f"block_size={self.block_size}."
+                )
+            if int(self.selector.top_k) != int(server_args.speculative_eagle_topk):
+                raise RuntimeError(
+                    "DFlash selector/runtime top-k mismatch: "
+                    f"selector={self.selector.top_k}, "
+                    f"runtime={server_args.speculative_eagle_topk}."
+                )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -409,6 +521,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._mask_token_id_override,
                 self._noise_embed_scale,
             )
+            if self.selector_tree_budget:
+                logger.warning(
+                    "DFLASH2 predecessor-conditioned selector tree active. "
+                    "non_root_budget=%d, verify_rows=%d, top_k=%d.",
+                    self.selector_tree_budget,
+                    self.block_size,
+                    int(self.selector.top_k),
+                )
 
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.block_size, device=self.device
@@ -687,6 +807,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 block_size=self.block_size,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
+                selector_tree_budget=self.selector_tree_budget,
             )
         tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
@@ -1137,6 +1258,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidate_ids, scores = _selector_lattice(
             draft_model, pred_hidden, anchor_token_ids
         )
+        if self.selector_tree_budget:
+            self._selector_tree = build_dflash_selector_tree_triton(
+                candidate_ids,
+                scores,
+                budget=self.selector_tree_budget,
+            )
+            return self._selector_tree.draft_tokens
         device = pred_hidden.device
         # Clamped like DSpark so greedy rows don't divide by zero.
         temperatures = (
@@ -1784,6 +1912,32 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
         self._validate_reduced_target_batch(batch, sampling_info)
+        if self.selector_tree_budget:
+            unsupported = []
+            if not _is_all_greedy(sampling_info):
+                unsupported.append("non-greedy sampling")
+            if batch.return_logprob:
+                unsupported.append("returned logprobs")
+            if batch.has_grammar:
+                unsupported.append("grammar")
+            if SIMULATE_ACC_LEN > 0:
+                unsupported.append("simulated acceptance")
+            if sampling_info is not None:
+                if sampling_info.has_custom_logit_processor:
+                    unsupported.append("custom logit processor")
+                penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+                if penalizer is not None and penalizer.is_required:
+                    unsupported.append("sampling penalties")
+                if getattr(sampling_info, "logit_bias", None) is not None:
+                    unsupported.append("logit bias")
+            if unsupported:
+                raise RuntimeError(
+                    "The experimental DFlash2 selector tree is ineligible for "
+                    "this batch: "
+                    + ", ".join(unsupported)
+                    + ". Restart without --dflash-selector-tree-budget."
+                )
+            return
         # A selector draft carries its own q and verifies through accept_sampling, so
         # it never falls back to greedy argmax however this build was compiled.
         if (
@@ -2071,6 +2225,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self.selector is not None:
             self._selector_sample = None
+            self._selector_tree = None
             if self._draft_sampler is not None:
                 # Consumed by the in-graph sample; must be staged before the replay.
                 self._draft_sampler.stage_sampling_params(
@@ -2086,7 +2241,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
-            if self.selector is not None and not _is_all_greedy(batch.sampling_info):
+            if self.selector_tree_budget:
+                sampler = self._draft_sampler
+                assert sampler.tree_parent_list is not None
+                assert sampler.tree_selected_index is not None
+                assert sampler.tree_parent is not None
+                assert sampler.tree_depth is not None
+                assert sampler.tree_candidate_index is not None
+                assert sampler.tree_cumulative is not None
+                self._selector_tree = DFlashSelectorTree(
+                    draft_tokens=draft_next,
+                    parent_list=sampler.tree_parent_list[:bs],
+                    selected_index=sampler.tree_selected_index[:bs],
+                    parent=sampler.tree_parent[:bs],
+                    depth=sampler.tree_depth[:bs],
+                    candidate_index=sampler.tree_candidate_index[:bs],
+                    cumulative_log_probability=sampler.tree_cumulative[:bs],
+                )
+            elif self.selector is not None and not _is_all_greedy(batch.sampling_info):
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
                     self._draft_sampler.q_out[:bs],
@@ -2120,15 +2292,70 @@ class DFlashWorkerV2(BaseSpecWorker):
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
         )
 
-        # --- 2) Target verify.
-        # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
+        # --- 2) Target verify.  Linear DFLASH is causal.  The optional
+        # predecessor-conditioned selector tree reuses SGLang's production EAGLE
+        # tree compiler for its attention mask, positions, and traversal links.
         custom_mask = None
-
+        retrieve_index = None
+        retrieve_next_token = None
+        retrieve_next_sibling = None
+        verify_positions = positions
         verify_input_ids = draft_tokens.reshape(-1)
+        tree_topk = 1
+        tree_depth = 1
+        if self.selector_tree_budget:
+            tree = self._selector_tree
+            if tree is None:
+                raise RuntimeError("DFlash2 selector tree output was not produced.")
+            target_attn_backend = self.target_worker.model_runner.attn_backend
+            verify_mask = target_attn_backend.verify_mask
+            if verify_mask is None:
+                tree_mask_buf = None
+                mask_mode = TreeMaskMode.FULL_MASK
+                fill_mask = True
+            else:
+                mask_mode = verify_mask.mode
+                fill_mask = verify_mask.is_read
+                tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
+            seq_lens_sum = batch.seq_lens_sum
+            if seq_lens_sum is None:
+                if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+                    seq_lens_sum = 0
+                else:
+                    seq_lens_sum = bs * target_attn_backend.max_context_len
+            (
+                custom_mask,
+                verify_positions,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                verify_input_ids,
+            ) = build_tree_kernel_efficient(
+                draft_input.bonus_tokens,
+                tree.parent_list,
+                tree.selected_index,
+                tree.draft_tokens,
+                prefix_lens,
+                seq_lens_sum,
+                int(self.selector.top_k),
+                block_size - 1,
+                block_size,
+                mask_mode,
+                tree_mask_buf,
+                fill_prefix_mask=fill_mask,
+            )
+            tree_topk = int(self.selector.top_k)
+            tree_depth = block_size - 1
+
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
-            positions=positions,
+            positions=verify_positions,
             draft_token_num=int(self.block_size),
+            topk=tree_topk,
+            tree_depth=tree_depth,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
@@ -2190,7 +2417,51 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidates = draft_tokens
         new_seq_lens = None
         target_predict = None
-        if self._selector_sample is not None:
+        tree_accept_index = None
+        if self.selector_tree_budget:
+            if self._use_reduced_target_head:
+                assert self._reduced_target_token_ids is not None
+                target_predict = _map_reduced_target_top1(
+                    logits_output.next_token_logits,
+                    self._reduced_target_token_ids,
+                ).view(bs, block_size)
+            else:
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, block_size)
+            predict = torch.zeros(
+                (bs * block_size,), dtype=torch.int32, device=device
+            )
+            tree_accept_index = torch.full(
+                (bs, block_size), -1, dtype=torch.int32, device=device
+            )
+            accept_len = torch.empty((bs,), dtype=torch.int32, device=device)
+            assert verify_input.retrieve_index is not None
+            assert verify_input.retrieve_next_token is not None
+            assert verify_input.retrieve_next_sibling is not None
+            verify_tree_greedy_func(
+                predicts=predict,
+                accept_index=tree_accept_index,
+                accept_token_num=accept_len,
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=verify_input.tree_topk,
+            )
+            commit_lens = accept_len + 1
+            compact_predict = _compact_tree_nodes_to_front(
+                predict,
+                tree_accept_index,
+                batch_size=bs,
+                verify_width=block_size,
+            )
+            out_tokens = compact_predict.view(bs, block_size)
+            bonus = out_tokens.gather(
+                1, (commit_lens.to(torch.int64) - 1).unsqueeze(1)
+            ).flatten()
+        elif self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
@@ -2298,7 +2569,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 chain_stride=block_size,
             )
 
-        if self._need_mamba_verify_commit:
+        if self.selector_tree_budget:
+            assert tree_accept_index is not None
+            commit_mamba_states_after_verify(
+                self.target_worker,
+                batch,
+                commit_lens,
+                tree_accept_index,
+                block_size,
+            )
+        elif self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
                 batch=batch,
@@ -2317,12 +2597,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
+        if self.selector_tree_budget:
+            assert tree_accept_index is not None
+            move_accept_tokens_to_target_kvcache(
+                batch,
+                tree_accept_index,
+                commit_lens - 1,
+                batch.token_to_kv_pool_allocator,
+            )
+            hidden = _compact_tree_nodes_to_front(
+                hidden,
+                tree_accept_index,
+                batch_size=bs,
+                verify_width=block_size,
+            )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_out_cache_loc,
             cache_loc_2d=verify_out_cache_loc_2d,
+            # Accepted tree paths have monotonically increasing depth, so after
+            # compaction their logical positions equal this original linear row.
             positions=positions,
             commit_lens=commit_lens,
         )

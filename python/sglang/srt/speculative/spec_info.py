@@ -423,11 +423,14 @@ def create_dummy_verify_input(
     elif spec_algorithm.is_dflash_family():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
+        selector_tree = bool(getattr(spec, "dflash_selector_tree_budget", None))
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
         spec_info = DFlashVerifyInput(
             draft_token=None,
             positions=None,
             draft_token_num=spec.speculative_num_draft_tokens,
+            topk=spec.speculative_eagle_topk if selector_tree else 1,
+            tree_depth=(spec.speculative_num_draft_tokens - 1 if selector_tree else 1),
             custom_mask=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL

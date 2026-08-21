@@ -2117,6 +2117,14 @@ class ServerArgs:
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
         NS("spec"),
     ] = None
+    dflash_selector_tree_budget: A[
+        Optional[int],
+        "DFLASH2 experimental. Build a predecessor-conditioned best-first "
+        "selector tree with this many non-root nodes. The initial qualified "
+        "path requires budget == block_size - 1, preserving the target verify "
+        "row count. Greedy CUDA tp=1 only; disabled when omitted.",
+        NS("spec"),
+    ] = None
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

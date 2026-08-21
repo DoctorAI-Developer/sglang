@@ -210,6 +210,15 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         self.topk = get_spec().speculative_eagle_topk or 0
+        # DFlash2's selector tree is constructed *after* the parallel draft
+        # block has run.  The draft block itself remains a causal chain; only
+        # the target verification forward consumes the tree.  Keep the draft
+        # FA backend on its proven linear path while publishing top-k > 1 to
+        # the target backend for tree verification.
+        if model_runner.is_draft_worker and getattr(
+            get_spec(), "dflash_selector_tree_budget", None
+        ):
+            self.topk = 1
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (

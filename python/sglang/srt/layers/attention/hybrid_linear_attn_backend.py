@@ -48,6 +48,13 @@ class MambaAttnBackendBase(AttentionBackend):
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        # A DFlash2 selector tree branches only at target verification.  The
+        # draft model first evaluates its fixed masked block as a causal chain,
+        # so draft-side recurrent metadata must not use the target tree shape.
+        if model_runner.is_draft_worker and getattr(
+            model_runner.server_args, "dflash_selector_tree_budget", None
+        ):
+            self.topk = 1
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool

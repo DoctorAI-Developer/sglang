@@ -34,9 +34,14 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
-    # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
-    # DFLASH verify is linear (non-tree), so this is always 1.
+    # Linear DFLASH uses topk=1.  The optional DFlash2 selector tree publishes
+    # its checkpoint branching factor so FA3 and hybrid GDN select their proven
+    # tree-verification paths.
     topk: int = 1
+    tree_depth: int = 1
+    retrieve_index: torch.Tensor | None = None
+    retrieve_next_token: torch.Tensor | None = None
+    retrieve_next_sibling: torch.Tensor | None = None
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
@@ -55,6 +60,14 @@ class DFlashVerifyInput(SpecInput):
         if self.num_tokens_per_req == -1:
             self.num_tokens_per_req = int(self.draft_token_num)
         self.num_tokens_for_logprob_per_req = int(self.draft_token_num)
+
+    @property
+    def max_tree_depth(self) -> int:
+        return int(self.tree_depth) + 1
+
+    @property
+    def tree_topk(self) -> int:
+        return int(self.topk)
 
     def prepare_for_verify(
         self,

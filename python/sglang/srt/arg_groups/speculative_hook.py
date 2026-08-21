@@ -167,9 +167,10 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
 
-    # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
-    # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
-    # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
+    # Linear DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields
+    # still affect generic scheduler/KV-cache and attention-backend setup.  The
+    # optional DFlash2 selector tree deliberately publishes the checkpoint's
+    # selector top-k so the existing FA3/GDN tree paths are captured.
     #
     # For DFlash, the natural unit is `block_size` (verify window length).
     if server_args.speculative_num_steps is None:
@@ -180,15 +181,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             server_args.speculative_num_steps,
         )
         server_args.speculative_num_steps = 1
-
-    if server_args.speculative_eagle_topk is None:
-        server_args.speculative_eagle_topk = 1
-    elif int(server_args.speculative_eagle_topk) != 1:
-        logger.warning(
-            "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
-            server_args.speculative_eagle_topk,
-        )
-        server_args.speculative_eagle_topk = 1
 
     if server_args.speculative_dflash_block_size is not None:
         if int(server_args.speculative_dflash_block_size) <= 0:
@@ -242,6 +234,77 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 inferred_block_size,
             )
         server_args.speculative_num_draft_tokens = inferred_block_size
+
+    selector_tree_budget = getattr(server_args, "dflash_selector_tree_budget", None)
+    if selector_tree_budget is None:
+        if server_args.speculative_eagle_topk is None:
+            server_args.speculative_eagle_topk = 1
+        elif int(server_args.speculative_eagle_topk) != 1:
+            logger.warning(
+                "Linear DFLASH only supports speculative_eagle_topk == 1; "
+                "overriding speculative_eagle_topk=%s to 1.",
+                server_args.speculative_eagle_topk,
+            )
+            server_args.speculative_eagle_topk = 1
+    else:
+        selector_tree_budget = int(selector_tree_budget)
+        block_size = int(server_args.speculative_num_draft_tokens)
+        if selector_tree_budget <= 0:
+            raise ValueError(
+                "--dflash-selector-tree-budget must be positive, got "
+                f"{selector_tree_budget}."
+            )
+        if selector_tree_budget != block_size - 1:
+            raise ValueError(
+                "The initial DFlash2 selector-tree path preserves the target "
+                "verification row count and therefore requires "
+                "--dflash-selector-tree-budget == block_size - 1. "
+                f"Got budget={selector_tree_budget}, block_size={block_size}."
+            )
+        if not server_args.device.startswith("cuda"):
+            raise ValueError(
+                "--dflash-selector-tree-budget currently requires a CUDA device."
+            )
+        if int(server_args.tp_size) != 1:
+            raise ValueError(
+                "--dflash-selector-tree-budget currently requires tensor "
+                f"parallel size 1, got tp_size={server_args.tp_size}."
+            )
+
+        from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        draft_hf_config = get_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.speculative_draft_model_revision,
+            model_override_args=json.loads(server_args.json_model_override_args),
+        )
+        draft_config = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+        selector_top_k = int(draft_config.selector_top_k)
+        if selector_top_k <= 1:
+            raise ValueError(
+                "--dflash-selector-tree-budget requires a DFlash2 checkpoint "
+                "with selector_top_k > 1."
+            )
+        if (
+            server_args.speculative_eagle_topk is not None
+            and int(server_args.speculative_eagle_topk) != selector_top_k
+        ):
+            raise ValueError(
+                "--speculative-eagle-topk conflicts with the DFlash2 selector "
+                f"checkpoint: requested={server_args.speculative_eagle_topk}, "
+                f"selector_top_k={selector_top_k}."
+            )
+        server_args.speculative_eagle_topk = selector_top_k
+        server_args.dflash_selector_tree_budget = selector_tree_budget
+        logger.warning(
+            "Experimental DFlash2 selector tree enabled: non_root_budget=%d, "
+            "verify_rows=%d, selector_top_k=%d. Greedy CUDA tp=1 only.",
+            selector_tree_budget,
+            block_size,
+            selector_top_k,
+        )
 
     if server_args.speculative_draft_window_size is not None:
         draft_tokens = int(server_args.speculative_num_draft_tokens)
