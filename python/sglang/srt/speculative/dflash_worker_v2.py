@@ -213,6 +213,14 @@ def _missing_target_top1_ids(
     return torch.unique(target_top1[~selected_token_mask[target_top1]])
 
 
+def _resolve_dflash_target_token_map(spec) -> Optional[str]:
+    """Resolve the target-only map while retaining the shared-map default."""
+    target_map = getattr(spec, "dflash_target_token_map", None)
+    if target_map is not None:
+        return target_map
+    return getattr(spec, "speculative_token_map", None)
+
+
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
@@ -457,7 +465,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "The reduced DFLASH target head requires a dense target lm_head."
             )
-        token_map_path = get_spec().speculative_token_map
+        spec = get_spec()
+        token_map_path = _resolve_dflash_target_token_map(spec)
         if token_map_path is None:
             raise RuntimeError(
                 "The reduced DFLASH target head requires a target token map."
@@ -471,15 +480,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head._dflash_reduced_target_weight = reduced_weight
         lm_head._dflash_reduced_target_ids = reduced_ids
         self._reduced_target_token_ids = reduced_ids
+        proposal_map_path = getattr(spec, "speculative_token_map", None)
+        shared_with_proposal = token_map_path == proposal_map_path
+        if not shared_with_proposal:
+            # The proposal sampler owns these fields. Keep the target tensors
+            # alive through lm_head/self references, then let proposal setup
+            # materialize its independently optimized map before graph capture.
+            self.draft_model._selector_hot_token_id = None
+            self.draft_model._selector_lm_head_weight = None
         if self.ps.tp_rank == 0:
             logger.warning(
                 "DFLASH reduced greedy TARGET_VERIFY head enabled. tokens=%d, "
-                "copied_head_mib=%.2f, source=%s. Omitted-vocabulary maxima are "
-                "not certified; this path is not production-qualified.",
+                "copied_head_mib=%.2f, source=%s, proposal_map_mode=%s. "
+                "Omitted-vocabulary maxima are not certified; this path is "
+                "not production-qualified.",
                 int(reduced_ids.numel()),
                 float(reduced_weight.numel() * reduced_weight.element_size())
                 / (1024**2),
                 token_map_path,
+                "shared" if shared_with_proposal else "independent",
             )
 
     def _validate_reduced_target_batch(self, batch, sampling_info) -> None:
@@ -511,7 +530,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not is_dense_head_weight(getattr(lm_head, "weight", None)):
             raise RuntimeError("The target top-1 audit requires a dense target lm_head.")
-        token_map_path = get_spec().speculative_token_map
+        token_map_path = _resolve_dflash_target_token_map(get_spec())
         if token_map_path is None:
             raise RuntimeError("The target top-1 audit requires a target token map.")
         token_ids = load_token_map(token_map_path).to(device=lm_head.weight.device)

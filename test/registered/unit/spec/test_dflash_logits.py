@@ -17,6 +17,7 @@ from sglang.srt.speculative.dflash_worker_v2 import (
     DFlashWorkerV2,
     _map_reduced_target_top1,
     _missing_target_top1_ids,
+    _resolve_dflash_target_token_map,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -227,6 +228,28 @@ def test_target_top1_audit_reports_only_unmapped_full_head_winners():
 
     with pytest.raises(ValueError, match="width mismatch"):
         _missing_target_top1_ids(logits, torch.ones(3, dtype=torch.bool))
+
+
+def test_dflash_target_map_can_be_independent_or_shared():
+    assert (
+        _resolve_dflash_target_token_map(
+            SimpleNamespace(
+                dflash_target_token_map="target.pt",
+                speculative_token_map="proposal.pt",
+            )
+        )
+        == "target.pt"
+    )
+    assert (
+        _resolve_dflash_target_token_map(
+            SimpleNamespace(
+                dflash_target_token_map=None,
+                speculative_token_map="shared.pt",
+            )
+        )
+        == "shared.pt"
+    )
+    assert _resolve_dflash_target_token_map(SimpleNamespace()) is None
 
 
 def test_grouped_conv_supports_runtime_block_sizes():

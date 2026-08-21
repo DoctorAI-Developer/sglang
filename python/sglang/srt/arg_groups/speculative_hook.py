@@ -253,10 +253,13 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     if getattr(server_args, "enable_dflash_reduced_target_head", False):
-        if server_args.speculative_token_map is None:
+        if (
+            getattr(server_args, "dflash_target_token_map", None) is None
+            and server_args.speculative_token_map is None
+        ):
             raise ValueError(
                 "--enable-dflash-reduced-target-head requires "
-                "--speculative-token-map."
+                "--dflash-target-token-map or --speculative-token-map."
             )
         if int(server_args.tp_size) != 1:
             raise ValueError(
@@ -270,10 +273,13 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
     if getattr(server_args, "enable_dflash_target_top1_audit", False):
-        if server_args.speculative_token_map is None:
+        if (
+            getattr(server_args, "dflash_target_token_map", None) is None
+            and server_args.speculative_token_map is None
+        ):
             raise ValueError(
                 "--enable-dflash-target-top1-audit requires "
-                "--speculative-token-map."
+                "--dflash-target-token-map or --speculative-token-map."
             )
         if getattr(server_args, "enable_dflash_reduced_target_head", False):
             raise ValueError(

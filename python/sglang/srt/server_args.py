@@ -2170,17 +2170,26 @@ class ServerArgs:
     speculative_token_map: A[
         Optional[str], "The path of the draft model's small vocab table.", NS("spec")
     ] = None
+    dflash_target_token_map: A[
+        Optional[str],
+        "DFLASH only. Optional target-verification vocabulary table. When "
+        "omitted, --speculative-token-map is reused so proposal and target "
+        "verification share one materialized head.",
+        NS("spec"),
+    ] = None
     enable_dflash_reduced_target_head: A[
         bool,
-        "DFLASH research only. Reuse --speculative-token-map as a reduced "
-        "TARGET_VERIFY lm_head for eligible greedy requests. Normal prefill and "
-        "ordinary decode retain the full target vocabulary.",
+        "DFLASH research only. Use --dflash-target-token-map, or fall back to "
+        "--speculative-token-map, as a reduced TARGET_VERIFY lm_head for "
+        "eligible greedy requests. Normal prefill and ordinary decode retain "
+        "the full target vocabulary.",
         NS("spec"),
     ] = False
     enable_dflash_target_top1_audit: A[
         bool,
         "DFLASH diagnostic only. Keep the full TARGET_VERIFY head and report "
-        "observed target top-1 IDs absent from --speculative-token-map.",
+        "observed target top-1 IDs absent from --dflash-target-token-map, or "
+        "from --speculative-token-map when no target-only map is supplied.",
         NS("spec"),
     ] = False
     speculative_attention_mode: A[
