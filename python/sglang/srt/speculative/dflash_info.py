@@ -42,6 +42,12 @@ class DFlashVerifyInput(SpecInput):
     retrieve_index: torch.Tensor | None = None
     retrieve_next_token: torch.Tensor | None = None
     retrieve_next_sibling: torch.Tensor | None = None
+    # DFlash selector-tree node ancestry in local verify-row coordinates.
+    # Shape [batch, verify_width, verify_width]; row n contains root-to-node
+    # indices at columns [0, depth[n]].  Full-attention backends can use this
+    # to replay each path with ordinary causal attention geometry.
+    dflash_path_indices: torch.Tensor | None = None
+    dflash_node_depth: torch.Tensor | None = None
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None

@@ -40,6 +40,75 @@ class DFlashSelectorTree:
     cumulative_log_probability: torch.Tensor
 
 
+@triton.jit
+def _dflash_tree_paths_kernel(
+    parent_ptr,
+    depth_ptr,
+    paths_ptr,
+    parent_stride_batch: tl.constexpr,
+    depth_stride_batch: tl.constexpr,
+    paths_stride_batch: tl.constexpr,
+    verify_width: tl.constexpr,
+):
+    """Expand direct parents into root-to-node path rows.
+
+    One program owns a request, so all stores are race-free.  The selector
+    tree is prefix-closed and parents always precede children; the bounded
+    static chase is therefore sufficient for every node.
+    """
+    batch = tl.program_id(0)
+    parent_base = batch * parent_stride_batch
+    depth_base = batch * depth_stride_batch
+    paths_base = batch * paths_stride_batch
+
+    for node in tl.static_range(verify_width):
+        for column in tl.static_range(verify_width):
+            tl.store(paths_ptr + paths_base + node * verify_width + column, 0)
+
+        current = node
+        for _ in tl.static_range(verify_width):
+            is_non_root = current > 0
+            safe = tl.maximum(current - 1, 0)
+            current_depth = tl.load(
+                depth_ptr + depth_base + safe,
+                mask=is_non_root,
+                other=0,
+            )
+            tl.store(
+                paths_ptr
+                + paths_base
+                + node * verify_width
+                + current_depth,
+                current,
+            )
+            current = tl.load(
+                parent_ptr + parent_base + safe,
+                mask=is_non_root,
+                other=0,
+            )
+
+
+def _build_dflash_tree_paths_triton_unchecked(
+    *,
+    parent: torch.Tensor,
+    depth: torch.Tensor,
+    paths_out: torch.Tensor,
+) -> None:
+    """Materialize bounded selector paths into caller-owned graph-safe storage."""
+    batch, non_root = map(int, parent.shape)
+    verify_width = non_root + 1
+    _dflash_tree_paths_kernel[(batch,)](
+        parent,
+        depth,
+        paths_out,
+        parent.stride(0),
+        depth.stride(0),
+        paths_out.stride(0),
+        verify_width=verify_width,
+        num_warps=1,
+    )
+
+
 def build_dflash_selector_tree_reference(
     candidate_ids: torch.Tensor,
     edge_scores: torch.Tensor,

@@ -123,6 +123,12 @@ class FlashAttentionMetadata:
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
+    # DFlash selector-tree exact causal-path replay metadata.
+    dflash_path_indices: torch.Tensor = None
+    dflash_output_indices: torch.Tensor = None
+    dflash_req_pool_indices: torch.Tensor = None
+    dflash_prefix_lens: torch.Tensor = None
+
 
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
@@ -219,6 +225,15 @@ class FlashAttentionBackend(AttentionBackend):
             get_spec(), "dflash_selector_tree_budget", None
         ):
             self.topk = 1
+        # The tree verifier's split-prefix cascade is mathematically equivalent
+        # to causal verification, but its reduction geometry can perturb close
+        # greedy argmaxes. Replay each root-to-node path with the ordinary
+        # linear-verifier geometry at every full-attention layer.
+        self.dflash_selector_tree_exact_path_attention = bool(
+            not model_runner.is_draft_worker
+            and getattr(get_spec(), "dflash_selector_tree_budget", None)
+        )
+        self.dflash_exact_tree_metadata = {}
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         if (
@@ -1501,6 +1516,41 @@ class FlashAttentionBackend(AttentionBackend):
                     out=_fa_out,
                     **kwargs,
                 )
+            elif self.dflash_selector_tree_exact_path_attention and use_cascade_attn:
+                # Selector-tree verification needs the same causal qlen geometry
+                # as a sequential replay of each root-to-node path.  This result
+                # is complete, so do not run the normal+expanded cascade only to
+                # overwrite it afterwards.
+                metadata_exact = self.dflash_exact_tree_metadata[
+                    forward_batch.batch_size
+                ]
+                verify_width = int(self.speculative_num_draft_tokens)
+                q_linear = q.contiguous().view(
+                    -1, layer.tp_q_head_num, layer.head_dim
+                )
+                q_paths = q_linear.index_select(
+                    0, metadata_exact.dflash_path_indices.reshape(-1)
+                )
+                o_paths = flash_attn_with_kvcache(
+                    q=q_paths,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=metadata_exact.page_table,
+                    cache_seqlens=metadata_exact.cache_seqlens_int32,
+                    cu_seqlens_q=metadata_exact.cu_seqlens_q,
+                    cu_seqlens_k_new=metadata_exact.cu_seqlens_k,
+                    max_seqlen_q=verify_width,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
+                    **kwargs,
+                )
+                o = o_paths.index_select(
+                    0, metadata_exact.dflash_output_indices.reshape(-1)
+                )
             else:
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1522,7 +1572,7 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
 
-            if use_cascade_attn:
+            if use_cascade_attn and not self.dflash_selector_tree_exact_path_attention:
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1553,7 +1603,9 @@ class FlashAttentionBackend(AttentionBackend):
                     o_expand,
                     softmax_lse_expand.T.contiguous(),
                 )
-            else:
+            elif not (
+                self.dflash_selector_tree_exact_path_attention and use_cascade_attn
+            ):
                 o = result
         else:
             if (
@@ -2414,6 +2466,57 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                 }
 
+            if self.dflash_selector_tree_exact_path_attention:
+                width = int(self.speculative_num_draft_tokens)
+                exact_sequences = max_bs * width
+                self.dflash_exact_tree_buffers = {
+                    # Capture-time dummy metadata must describe valid qlen=width
+                    # sequences because topk>1 capture returns before replay-side
+                    # metadata population.  Real lengths replace these values.
+                    "cache_seqlens": torch.full(
+                        (exact_sequences,),
+                        width,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    "cu_seqlens_q": torch.arange(
+                        0,
+                        exact_sequences * width + 1,
+                        step=width,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    "cu_seqlens_k": torch.arange(
+                        0,
+                        exact_sequences * width + 1,
+                        step=width,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    "page_table": torch.zeros(
+                        exact_sequences,
+                        max_num_pages,
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
+                    "req_pool_indices": torch.zeros(
+                        exact_sequences, dtype=torch.int64, device=self.device
+                    ),
+                    "prefix_lens": torch.zeros(
+                        exact_sequences, dtype=torch.int32, device=self.device
+                    ),
+                    "path_indices": torch.zeros(
+                        max_bs,
+                        width,
+                        width,
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    "output_indices": torch.zeros(
+                        max_bs, width, dtype=torch.int64, device=self.device
+                    ),
+                }
+
         # Only allocate encoder metadata for encoder-decoder models
         if self.is_encoder_decoder:
             self.encoder_metadata = {
@@ -2594,6 +2697,37 @@ class FlashAttentionBackend(AttentionBackend):
 
                 self.target_verify_metadata_topk_normal[bs] = metadata
                 self.target_verify_metadata_topk_expand[bs] = metadata_expand
+
+                if self.dflash_selector_tree_exact_path_attention:
+                    width = int(self.speculative_num_draft_tokens)
+                    exact_sequences = bs * width
+                    buffers = self.dflash_exact_tree_buffers
+                    metadata_exact = FlashAttentionMetadata()
+                    metadata_exact.cache_seqlens_int32 = buffers[
+                        "cache_seqlens"
+                    ][:exact_sequences]
+                    metadata_exact.max_seq_len_q = width
+                    metadata_exact.max_seq_len_k = self.max_context_len
+                    metadata_exact.cu_seqlens_q = buffers["cu_seqlens_q"][
+                        : exact_sequences + 1
+                    ]
+                    metadata_exact.cu_seqlens_k = buffers["cu_seqlens_k"][
+                        : exact_sequences + 1
+                    ]
+                    metadata_exact.page_table = buffers["page_table"][
+                        :exact_sequences
+                    ]
+                    metadata_exact.dflash_req_pool_indices = buffers[
+                        "req_pool_indices"
+                    ][:exact_sequences]
+                    metadata_exact.dflash_prefix_lens = buffers["prefix_lens"][
+                        :exact_sequences
+                    ]
+                    metadata_exact.dflash_path_indices = buffers["path_indices"][:bs]
+                    metadata_exact.dflash_output_indices = buffers[
+                        "output_indices"
+                    ][:bs]
+                    self.dflash_exact_tree_metadata[bs] = metadata_exact
                 # topk>1 target-verify early-returns before _apply; bind the
                 # view here (buffer refilled at replay).
                 if self.use_sliding_window_kv_pool:
@@ -3002,6 +3136,86 @@ class FlashAttentionBackend(AttentionBackend):
                         dtype=torch.int32,
                     )
                 )
+                if self.dflash_selector_tree_exact_path_attention:
+                    if self.page_size != 1:
+                        raise RuntimeError(
+                            "DFlash exact selector paths currently require page_size=1."
+                        )
+                    path_indices = getattr(
+                        spec_info, "dflash_path_indices", None
+                    )
+                    node_depth = getattr(spec_info, "dflash_node_depth", None)
+                    if path_indices is None or node_depth is None:
+                        raise RuntimeError(
+                            "DFlash selector-tree replay did not publish path metadata."
+                        )
+                    width = int(self.speculative_num_draft_tokens)
+                    exact_sequences = bs * width
+                    metadata_exact = self.dflash_exact_tree_metadata[bs]
+                    expanded_req = req_pool_indices.repeat_interleave(width)
+                    expanded_prefix = seq_lens.repeat_interleave(width).to(
+                        torch.int32
+                    )
+                    metadata_exact.dflash_req_pool_indices.copy_(expanded_req)
+                    metadata_exact.dflash_prefix_lens.copy_(expanded_prefix)
+                    metadata_exact.cache_seqlens_int32.copy_(
+                        expanded_prefix + width
+                    )
+                    metadata_exact.cu_seqlens_k[1:].copy_(
+                        torch.cumsum(
+                            metadata_exact.cache_seqlens_int32,
+                            dim=0,
+                            dtype=torch.int32,
+                        )
+                    )
+                    build_trtllm_mha_page_table(
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=metadata_exact.dflash_req_pool_indices,
+                        cache_seqlens=metadata_exact.cache_seqlens_int32,
+                        page_table=metadata_exact.page_table,
+                        page_size=1,
+                    )
+
+                    local_paths = metadata_exact.dflash_path_indices
+                    local_paths.zero_()
+                    real_bs = path_indices.shape[0]
+                    local_paths[:real_bs].copy_(path_indices.to(torch.int64))
+                    batch_offsets = (
+                        torch.arange(bs, device=device, dtype=torch.int64)
+                        .view(bs, 1, 1)
+                        .mul(width)
+                    )
+                    local_paths.add_(batch_offsets)
+                    depths = torch.zeros(
+                        (bs, width), dtype=torch.int64, device=device
+                    )
+                    depths[:real_bs].copy_(node_depth.to(torch.int64))
+                    node_rows = torch.arange(
+                        exact_sequences, device=device, dtype=torch.int64
+                    ).view(bs, width)
+                    metadata_exact.dflash_output_indices.copy_(
+                        node_rows * width + depths
+                    )
+
+                    local_for_slots = (
+                        local_paths
+                        - batch_offsets
+                    ).reshape(exact_sequences, width)
+                    rows = torch.arange(
+                        exact_sequences, device=device, dtype=torch.int64
+                    ).unsqueeze(1)
+                    columns = expanded_prefix.to(torch.int64).unsqueeze(1) + (
+                        torch.arange(width, device=device, dtype=torch.int64)
+                    )
+                    tree_columns = expanded_prefix.to(torch.int64).unsqueeze(1) + (
+                        local_for_slots
+                    )
+                    tree_slots = self.req_to_token[
+                        expanded_req.to(torch.int64).unsqueeze(1), tree_columns
+                    ]
+                    metadata_exact.page_table[rows, columns] = tree_slots.to(
+                        torch.int32
+                    )
                 if self.has_swa:
                     metadata_swa = self.target_verify_metadata_topk_swa[bs]
                     self._init_sliding_window_attn_spec_metadata(

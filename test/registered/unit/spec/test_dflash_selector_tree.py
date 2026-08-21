@@ -106,6 +106,74 @@ def test_triton_tree_matches_reference_score_ties() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_triton_tree_paths_expand_predecessor_chains() -> None:
+    from sglang.kernels.ops.speculative.dflash_tree import (
+        _build_dflash_tree_paths_triton_unchecked,
+    )
+
+    parent = torch.tensor(
+        [[0, 1, 0, 3, 4, 0, 6]], dtype=torch.int32, device="cuda"
+    )
+    depth = torch.tensor(
+        [[1, 2, 1, 2, 3, 1, 2]], dtype=torch.int32, device="cuda"
+    )
+    paths = torch.empty((1, 8, 8), dtype=torch.int64, device="cuda")
+    _build_dflash_tree_paths_triton_unchecked(
+        parent=parent,
+        depth=depth,
+        paths_out=paths,
+    )
+
+    assert paths.cpu().tolist() == [
+        [
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0, 0, 0],
+            [0, 1, 2, 0, 0, 0, 0, 0],
+            [0, 3, 0, 0, 0, 0, 0, 0],
+            [0, 3, 4, 0, 0, 0, 0, 0],
+            [0, 3, 4, 5, 0, 0, 0, 0],
+            [0, 6, 0, 0, 0, 0, 0, 0],
+            [0, 6, 7, 0, 0, 0, 0, 0],
+        ]
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_triton_tree_paths_match_cpu_chase_for_random_selector_tree() -> None:
+    from sglang.kernels.ops.speculative.dflash_tree import (
+        _build_dflash_tree_paths_triton_unchecked,
+        build_dflash_selector_tree_triton,
+    )
+
+    generator = torch.Generator().manual_seed(20260821)
+    candidate_ids = torch.stack(
+        [torch.randperm(2048, generator=generator)[: 7 * 16].view(7, 16)]
+        * 4
+    ).to(torch.int64)
+    edge_scores = torch.randn((4, 7, 16, 16), generator=generator)
+    tree = build_dflash_selector_tree_triton(
+        candidate_ids.cuda(), edge_scores.cuda(), budget=7
+    )
+    paths = torch.empty((4, 8, 8), dtype=torch.int64, device="cuda")
+    _build_dflash_tree_paths_triton_unchecked(
+        parent=tree.parent,
+        depth=tree.depth,
+        paths_out=paths,
+    )
+
+    expected = torch.zeros((4, 8, 8), dtype=torch.int64)
+    parent_cpu = tree.parent.cpu()
+    depth_cpu = tree.depth.cpu()
+    for batch in range(4):
+        for node in range(1, 8):
+            current = node
+            while current:
+                expected[batch, node, depth_cpu[batch, current - 1]] = current
+                current = int(parent_cpu[batch, current - 1])
+    assert torch.equal(paths.cpu(), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_selector_tree_encoding_drives_existing_sglang_verifier() -> None:
     from sglang.kernels.ops.speculative.dflash_tree import (
         build_dflash_selector_tree_triton,

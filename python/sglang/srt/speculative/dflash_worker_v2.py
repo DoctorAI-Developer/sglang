@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.dflash import (
 from sglang.kernels.ops.speculative.dflash_tree import (
     DFlashSelectorTree,
     _build_dflash_selector_tree_triton_unchecked,
+    _build_dflash_tree_paths_triton_unchecked,
     build_dflash_selector_tree_triton,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
@@ -544,6 +545,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             None  # [cap_bs, block_size]
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._selector_path_indices_buf: Optional[torch.Tensor] = None
+        self._selector_node_depth_buf: Optional[torch.Tensor] = None
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
@@ -959,6 +962,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
+        if self.selector_tree_budget:
+            self._selector_path_indices_buf = torch.empty(
+                (new_cap, block_size, block_size),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._selector_node_depth_buf = torch.empty(
+                (new_cap, block_size), dtype=torch.int32, device=device
+            )
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
@@ -2303,10 +2315,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_input_ids = draft_tokens.reshape(-1)
         tree_topk = 1
         tree_depth = 1
+        dflash_path_indices = None
+        dflash_node_depth = None
         if self.selector_tree_budget:
             tree = self._selector_tree
             if tree is None:
                 raise RuntimeError("DFlash2 selector tree output was not produced.")
+            assert self._selector_path_indices_buf is not None
+            assert self._selector_node_depth_buf is not None
+            dflash_path_indices = self._selector_path_indices_buf[:bs]
+            dflash_node_depth = self._selector_node_depth_buf[:bs]
+            dflash_node_depth[:, 0].zero_()
+            dflash_node_depth[:, 1:].copy_(tree.depth)
+            _build_dflash_tree_paths_triton_unchecked(
+                parent=tree.parent,
+                depth=tree.depth,
+                paths_out=dflash_path_indices,
+            )
             target_attn_backend = self.target_worker.model_runner.attn_backend
             verify_mask = target_attn_backend.verify_mask
             if verify_mask is None:
@@ -2357,6 +2382,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             custom_mask=custom_mask,
+            dflash_path_indices=dflash_path_indices,
+            dflash_node_depth=dflash_node_depth,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
