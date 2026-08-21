@@ -1214,7 +1214,15 @@ class FlashInferAttnBackend(AttentionBackend):
             use_custom_mask = (
                 forward_mode.is_target_verify()
                 and spec_info is not None
-                and getattr(spec_info, "custom_mask", None) is not None
+                and (
+                    getattr(spec_info, "custom_mask", None) is not None
+                    # DFlash selector-tree capture uses a shape-only spec input;
+                    # its live custom mask is materialized when the request is
+                    # loaded. FlashInfer fixes mask capability at wrapper
+                    # construction, so reserve the buffers from the input type
+                    # rather than from the capture-time tensor alone.
+                    or spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+                )
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
